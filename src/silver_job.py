@@ -179,6 +179,31 @@ def dedup(df: pd.DataFrame) -> tuple[pd.DataFrame, int]:
     return deduped, before - len(deduped)
 
 
+def dedup_quarantine(df: pd.DataFrame) -> tuple[pd.DataFrame, int]:
+    """
+    Quarantine needs the SAME idempotency guarantee as the main path.
+    A redelivered bad record is still a duplicate, and double-counting it
+    corrupts the rejected total in the daily reconciliation.
+
+    Unparseable records have no event_id, so fall back to the raw bytes.
+    """
+    if df.empty:
+        return df, 0
+
+    before = len(df)
+    key = df["event_id"].fillna("")
+    key = key.where(key != "", df["raw"])
+
+    deduped = (
+        df.assign(_dedup_key=key)
+          .sort_values(["_dedup_key", "ingest_ts"])
+          .drop_duplicates(subset=["_dedup_key"], keep="first")
+          .drop(columns=["_dedup_key"])
+          .reset_index(drop=True)
+    )
+    return deduped, before - len(deduped)
+
+
 # --------------------------------------------------------------------------
 # write
 # --------------------------------------------------------------------------
@@ -211,11 +236,14 @@ def main() -> None:
 
     good, bad = parse_and_validate(bronze, cfg)
     print(f"parsed ok                  : {len(good):,}")
-    print(f"quarantined                : {len(bad):,}")
+    print(f"quarantined (raw)          : {len(bad):,}")
 
-    good, dup_count = dedup(good)
-    print(f"duplicates removed         : {dup_count:,}")
+    good, dup_good = dedup(good)
+    bad, dup_bad = dedup_quarantine(bad)
+    print(f"duplicates removed (good)  : {dup_good:,}")
+    print(f"duplicates removed (bad)   : {dup_bad:,}")
     print(f"silver records             : {len(good):,}")
+    print(f"quarantine records         : {len(bad):,}")
 
     good["event_dt"] = pd.to_datetime(good["event_ts"]).dt.strftime("%Y-%m-%d")
 
