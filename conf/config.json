@@ -1,0 +1,30 @@
+{
+  "project": "payment-lakehouse",
+  "region": "ap-south-1",
+  "bucket": "payment-lakehouse-harshit-ap1",
+  "stream_name": "payment-events",
+
+  "_comment_regions": "weight drives deliberate skew: IN is 40% of volume. retry_window_days is the per-region matching window and is the reason this lives in config, not code.",
+  "regions": [
+    { "code": "IN", "weight": 0.40, "currency": "INR", "retry_window_days": 7 },
+    { "code": "US", "weight": 0.20, "currency": "USD", "retry_window_days": 3 },
+    { "code": "EU", "weight": 0.15, "currency": "EUR", "retry_window_days": 5 },
+    { "code": "SG", "weight": 0.15, "currency": "SGD", "retry_window_days": 4 },
+    { "code": "AE", "weight": 0.10, "currency": "AED", "retry_window_days": 10 }
+  ],
+
+  "_comment_defects": "every rate here exists to exercise one downstream control. do not set them to zero.",
+  "defects": {
+    "duplicate_rate": 0.02,
+    "malformed_rate": 0.01,
+    "late_invoice_rate": 0.05,
+    "amount_mismatch_rate": 0.03,
+    "no_invoice_rate": 0.08
+  },
+
+  "generation": {
+    "window_days": 12,
+    "late_min_days": 1,
+    "late_max_days": 7
+  }
+}
