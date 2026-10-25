@@ -1,7 +1,8 @@
 {
   "project": "payment-lakehouse",
-  "region": "ap-south-1",
-  "bucket": "payment-lakehouse-harshit-ap1",
+  "_comment_region": "Account 569854554172 is SCP-restricted to ap-southeast-2. ap-south-1 and us-east-1 are explicitly denied — do not change this without retesting.",
+  "region": "ap-southeast-2",
+  "bucket": "payment-lakehouse-harshit-apse2",
   "stream_name": "payment-events",
 
   "_comment_regions": "weight drives deliberate skew: IN is 40% of volume. retry_window_days is the per-region matching window and is the reason this lives in config, not code.",
