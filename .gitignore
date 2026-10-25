@@ -1,0 +1,45 @@
+# ============================================================
+# SECRETS — the only section that really matters
+# ============================================================
+.env
+.env.*
+*.pem
+*.key
+*.pfx
+credentials
+credentials.*
+*credentials*.csv          # AWS console downloads keys as a .csv — this is the one
+accessKeys.csv
+.aws/
+aws_config*
+secrets.*
+
+# ============================================================
+# PYTHON
+# ============================================================
+venv/
+.venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.ipynb_checkpoints/
+
+# ============================================================
+# GENERATED DATA — never commit synthetic events or outputs
+# ============================================================
+data/
+output/
+tmp/
+*.parquet
+*.avro
+events_*.json
+*.log
+
+# ============================================================
+# OS / EDITOR
+# ============================================================
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
