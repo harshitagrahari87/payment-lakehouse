@@ -186,3 +186,102 @@ unique 9,258 = 9,258  ✓      quarantined 63 = 63  ✓
    bug, and it is the reason the generator emits an answer key at all.
 
 ---
+
+## #4 — Three hours lost because I never varied the region
+
+**Date:** Oct 25, 2026
+**Severity:** Blocker — believed to be a service ban, was a region restriction
+
+**What I believed**
+Every AWS data service was denied on the account:
+```
+s3:CreateBucket        DENIED
+kinesis:ListStreams    DENIED
+glue:GetDatabases      DENIED
+lambda:ListFunctions   DENIED
+athena:ListWorkGroups  DENIED
+```
+All five carried an explicit deny from SCP `p-sngva019`. The conclusion drawn
+was that the account's plan blocked the analytics stack entirely.
+
+**What was actually true**
+The account is restricted to **one region: `ap-southeast-2`**. Every failing
+call had been made against `ap-south-1` or `us-east-1`.
+
+**The clue that was present the entire time**
+`aws s3 ls` **succeeded** throughout. `ListAllMyBuckets` is a *global*
+endpoint and carries no region. Every call that failed carried an explicit
+`--region`. CloudShell had also defaulted to `ap-southeast-2` from the start.
+
+**The diagnostic error**
+Three hypotheses were tested by varying **principal** (IAM user -> custom role
+-> AWS-managed role) and **action** (S3 -> Kinesis -> Glue -> Lambda -> Athena).
+**Region was never varied** — it was treated as fixed context rather than as a
+parameter. One call to `lambda:ListFunctions --region ap-southeast-2` returned
+`{"Functions": []}` and the whole picture inverted.
+
+**Cost of the error**
+~3 hours. Also prompted a Paid Plan upgrade that was probably unnecessary —
+the Athena `primary` workgroup in `ap-southeast-2` was created at 09:02 UTC,
+three hours *before* the upgrade, so the region was already live on the Free
+Plan. The upgrade did buy a $20 hard spend limit, which is a real control, so
+it was not wasted.
+
+**What was correctly refused**
+Activating AWS Organizations advanced features would have allowed the SCPs to
+be deleted. The console stated it **removes spend limits** and **cannot be
+reversed**. Declining an irreversible removal of a cost control, to solve a
+problem that had a free support path, was the right call — and the region
+discovery made it moot.
+
+---
+
+## #5 — PutRecords returned HTTP 200 and lost 639 records
+
+**Date:** Oct 26, 2026
+**Severity:** Would have been silent data loss
+
+**What happened**
+The producer sent 9,446 events to a single-shard Kinesis stream as fast as the
+API allowed. Every `PutRecords` call returned **HTTP 200**. Inside those
+successful responses, **639 records carried `ErrorCode:
+ProvisionedThroughputExceededException`**.
+
+A shard accepts 1,000 records/sec or 1 MB/sec. The producer exceeded the
+record ceiling, and Kinesis rejected the excess **per record**, not per call.
+
+**Why this is dangerous**
+```python
+response = client.put_records(...)   # 200 OK
+# done, right?
+```
+Nothing raises. No exception, no non-2xx status. A producer that checks only
+the HTTP status silently drops records, and the loss is invisible until
+someone reconciles totals — which most pipelines never do.
+
+**Fix**
+```python
+failed = response["FailedRecordCount"]
+if failed:
+    # resend ONLY the failed subset. Resending the whole chunk would
+    # duplicate the records that already succeeded.
+    chunk = [rec for rec, result in zip(chunk, response["Records"])
+             if result.get("ErrorCode")]
+```
+with exponential backoff, up to 5 attempts.
+
+**Verification**
+All 9,446 records reached bronze, and silver/gold reconciled exactly to the
+answer key (9,258 unique / 63 quarantined / 4,115 matched). Had the 639 been
+dropped, the control total would have failed by that amount.
+
+**Takeaways**
+1. **`PutRecords` is a partial-failure API.** So is DynamoDB `BatchWriteItem`
+   (`UnprocessedItems`) and SQS `SendMessageBatch` (`Failed`). HTTP 200 means
+   the *call* succeeded, not that every *item* did.
+2. **Resend the failed subset, never the whole batch** — otherwise the retry
+   duplicates everything that already landed.
+3. Throttling is the expected behaviour of a correctly-sized shard under
+   burst, not a misconfiguration. The producer is responsible for backpressure.
+
+---

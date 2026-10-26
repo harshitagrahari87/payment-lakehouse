@@ -91,6 +91,51 @@ S3 at 5.4 MB total and Athena at the 10 MB minimum are rounding errors.
 
 ---
 
+## 4. Streaming path — measured Oct 26
+
+Full run: `producer --sink kinesis` -> Kinesis (1 shard) -> Lambda -> S3 bronze.
+
+| | |
+|---|---|
+| Records sent | 9,446 |
+| **Throttled and resent** | **639** |
+| Lambda invocations | 95 (94 full batches of 100, one of 46) |
+| Lambda duration | 35-50 ms typical, 136 ms max |
+| Memory allocated / used | 256 MB / **98 MB** |
+| Bronze objects landed | 95 |
+| End-to-end reconciliation | ALL MATCH |
+
+### The 639 throttled records
+One shard accepts 1,000 records/sec or 1 MB/sec. `PutRecords` returned
+**HTTP 200 with `FailedRecordCount: 639`** — a partial failure, not an error.
+
+Without resending only the failed subset, 639 payments would have been lost
+silently and the pipeline would still have reported success. The reconciliation
+against the answer key is what proves they all arrived.
+
+**A 200 from PutRecords does not mean every record landed.**
+
+### Batch flush behaviour
+Batches of 100 flushed on `BatchSize`; the final batch of 46 flushed on
+`MaximumBatchingWindowInSeconds=10`. The event source mapping polls and
+batches — the function never implements a poll loop.
+
+### Lambda right-sizing
+98 MB used of 256 MB allocated. Lambda CPU scales **with** memory, so halving
+memory also halves CPU; at 35-50 ms per invocation the cost difference is
+negligible either way. Memory here is a performance dial, not a limit.
+
+### Cost of this run
+```
+Kinesis   1 shard  ~$0.36/day, deleted after ~8 minutes   ~= $0.002
+Lambda    95 invocations x ~45 ms @ 256 MB                 free tier
+S3        95 PUTs + 4.4 MB                                 fractions of a cent
+```
+`infra/teardown.sh` removed the stream, function, mapping and IAM role
+immediately afterwards. Verified: `list-streams` returned empty.
+
+---
+
 ## 5. Business finding the pipeline produced
 
 | Region | Retry window | Expired | Payments | Write-off rate |
