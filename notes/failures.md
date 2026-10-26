@@ -275,13 +275,99 @@ All 9,446 records reached bronze, and silver/gold reconciled exactly to the
 answer key (9,258 unique / 63 quarantined / 4,115 matched). Had the 639 been
 dropped, the control total would have failed by that amount.
 
+---
+
+## #6 — Two writers, one prefix: Athena double-counted everything
+
+**Date:** Oct 26, 2026
+**Severity:** Silent — both jobs reported SUCCESS, the table was wrong
+
+**What happened**
+The Glue/PySpark job and the pandas job were both run against `gold/`. Each
+printed a correct, internally-consistent control total. Athena then returned:
+
+```
+Athena    MATCHED 8,230   PENDING 946   EXPIRED 412   MISMATCH 286
+gold_job  MATCHED 4,115   PENDING 487   EXPIRED 192   MISMATCH 143
+```
+
+**Root cause**
+The two writers use different file-naming conventions:
+
+```
+part-00000-<uuid>-c000.snappy.parquet    Spark
+part-000.parquet                          pandas / pyarrow
+```
+
+Spark's `mode("overwrite")` removed the files it knew about; the pandas job
+then `put_object`'d its own key alongside. Neither deleted the other.
+
+**A Hive-style external table is "whatever files are under the prefix."**
+Athena read both sets and summed them.
+
+The counts were not exactly 2x because the two runs used different `as_of`
+values — 28 payments had crossed from PENDING to EXPIRED between them. Same
+payments, two snapshots, both live in the table simultaneously.
+
+**Why the reconciliation gate did not catch it**
+Each job validated **its own DataFrame in memory**. Both were correct.
+Nothing validated the state of the **table** afterwards.
+
+> A control total on your output is not a control total on the table.
+
+**Fix**
+Both S3 writers now clear their prefix (paginated `list_objects_v2` ->
+`delete_objects`) before writing. The writer owns its prefix.
+
+**The real lesson — this is why Iceberg and Delta exist**
+A Hive table is defined by directory listing. A table format is defined by a
+**transaction log** that names exactly which files constitute the current
+snapshot. Under Iceberg, a stray file written by another process is simply
+not part of the table, and `overwrite` is an atomic commit rather than a
+sequence of deletes and puts that another writer can interleave with.
+
+This is no longer a textbook argument — it is a bug reproduced on this data.
+
 **Takeaways**
-1. **`PutRecords` is a partial-failure API.** So is DynamoDB `BatchWriteItem`
-   (`UnprocessedItems`) and SQS `SendMessageBatch` (`Failed`). HTTP 200 means
-   the *call* succeeded, not that every *item* did.
-2. **Resend the failed subset, never the whole batch** — otherwise the retry
-   duplicates everything that already landed.
-3. Throttling is the expected behaviour of a correctly-sized shard under
-   burst, not a misconfiguration. The producer is responsible for backpressure.
+1. **Two writers in one prefix is a correctness bug**, not an untidiness
+   issue. It needs a table format or an exclusive-writer guarantee.
+2. **`overwrite` only removes what the writer knows about.** It is not a
+   directory truncation.
+3. Validate the **table**, not just the DataFrame. The gate should read back
+   from the target after writing — that is the only check that would have
+   caught this.
+
+---
+
+## #7 — Reconciliation failed because the answer key was newer than the data
+
+**Date:** Oct 26, 2026
+**Severity:** Low — false alarm, but it cost time
+
+**Symptom**
+```
+PENDING   expected 487   actual 449
+EXPIRED   expected 192   actual 230
+```
+38 payments had moved from PENDING to EXPIRED. MATCHED, MISMATCH and
+REJECTED all matched exactly.
+
+**Cause**
+`data/bronze/` held events generated on Oct 25. `_expected_totals.json` had
+been regenerated on Oct 26. The producer anchors `event_ts` to `now()`, so
+**the same `--seed` does not produce the same timestamps on a different day**
+— only the same random *choices*.
+
+The pipeline was correct. The answer key described a different dataset.
+
+**Fix**
+Regenerate the whole chain together: producer -> bronze -> silver -> gold.
+
+**Takeaway**
+`--seed` makes the random decisions reproducible, not the absolute timestamps.
+A fixture and the expectations derived from it are **one artifact** and must
+be regenerated as a unit. The state machine is time-dependent by design, so
+only MATCHED and REJECTED are time-invariant — which is exactly why PENDING
+and EXPIRED were the two that drifted.
 
 ---

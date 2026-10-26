@@ -162,7 +162,7 @@ payments are worse, but because its matching window is 3 days instead of 7.
 | `as_of` | DAG `data_interval_end` | `now()` | PENDING vs EXPIRED depends on the date asked; `now()` makes backfills rewrite history | — |
 | Compute | pandas | PySpark | 9,446 records — Spark's JVM and shuffle overhead exceed the work | volume reaches ~3 GB/day, then Glue Spark |
 | Serving | Athena on S3 | Redshift | spiky analyst queries, pay-per-query, no idle cluster | sustained BI concurrency needing WLM |
-| Table format | Parquet | Iceberg / Delta | no concurrent writers or row-level updates yet | gold needed MERGE, time travel, or schema evolution |
+| Table format | Parquet | Iceberg / Delta | no concurrent writers or row-level updates when the choice was made | **already hit this** — two writers in one prefix silently doubled every count (`failures.md` #6). Iceberg's transaction log defines which files are the table; a Hive prefix does not. This is the next change. |
 
 ---
 

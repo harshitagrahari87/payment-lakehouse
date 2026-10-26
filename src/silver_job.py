@@ -45,6 +45,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import io
 import json
 from pathlib import Path
 
@@ -252,26 +253,40 @@ def write_partitioned(df: pd.DataFrame, out_root: Path, name: str) -> int:
 
 def write_partitioned_s3(df: pd.DataFrame, cfg: dict, name: str) -> int:
     """
-    Same layout on S3. The key is deterministic (silver/<name>/event_dt=X/
-    part-000.parquet) so a re-run REPLACES the partition rather than adding
-    a second file — the same idempotency rule bronze uses.
-    """
-    import io
+    Same layout on S3, with the prefix cleared first.
 
+    Clearing matters because this job and the Spark/Glue version write
+    different filenames (part-000.parquet vs part-00000-<uuid>-c000.snappy
+    .parquet). A Hive-style table is "whatever files are in the directory",
+    so without this both sets survive and every downstream count doubles —
+    while both jobs still report success. See notes/failures.md #6.
+    """
     import boto3
 
     if df.empty:
         return 0
 
     s3 = boto3.client("s3", region_name=cfg["region"])
-    written = 0
+    prefix = f"silver/{name}/"
 
+    removed = 0
+    for page in s3.get_paginator("list_objects_v2").paginate(
+        Bucket=cfg["bucket"], Prefix=prefix
+    ):
+        keys = [{"Key": o["Key"]} for o in page.get("Contents", [])]
+        if keys:
+            s3.delete_objects(Bucket=cfg["bucket"], Delete={"Objects": keys})
+            removed += len(keys)
+    if removed:
+        print(f"  cleared {removed} stale object(s) under {prefix}")
+
+    written = 0
     for event_dt, part in df.groupby("event_dt"):
         buf = io.BytesIO()
         part.drop(columns=["event_dt"]).to_parquet(buf, index=False)
         s3.put_object(
             Bucket=cfg["bucket"],
-            Key=f"silver/{name}/event_dt={event_dt}/part-000.parquet",
+            Key=f"{prefix}event_dt={event_dt}/part-000.parquet",
             Body=buf.getvalue(),
         )
         written += 1

@@ -227,8 +227,37 @@ def build_reconciliation_daily(fct: pd.DataFrame) -> pd.DataFrame:
 # write
 # --------------------------------------------------------------------------
 
+def _clear_prefix(s3, bucket: str, prefix: str) -> int:
+    """
+    Delete everything under a prefix before writing.
+
+    Why this is necessary: a Hive-style table is "whatever files are in the
+    directory". Two writers with different file-naming conventions — Spark's
+    part-00000-<uuid>-c000.snappy.parquet and this job's part-000.parquet —
+    will happily coexist, and Athena will read BOTH and double every count.
+
+    Neither job notices: each one validates its own DataFrame, and both are
+    internally correct. The table is what is wrong.
+
+    This is precisely what Iceberg/Delta solve. Their transaction log names
+    the files that constitute the current snapshot, so a stray file written
+    by another process is simply not part of the table. With plain Parquet
+    the writer has to own its prefix explicitly.
+    """
+    deleted = 0
+    for page in s3.get_paginator("list_objects_v2").paginate(Bucket=bucket, Prefix=prefix):
+        keys = [{"Key": o["Key"]} for o in page.get("Contents", [])]
+        if keys:
+            s3.delete_objects(Bucket=bucket, Delete={"Objects": keys})
+            deleted += len(keys)
+    return deleted
+
+
 def write_local(df: pd.DataFrame, root: Path, name: str) -> str:
     target = root / name
+    if target.exists():
+        for stale in target.glob("*.parquet"):
+            stale.unlink()
     target.mkdir(parents=True, exist_ok=True)
     df.to_parquet(target / "part-000.parquet", index=False)
     return str(target)
@@ -237,12 +266,16 @@ def write_local(df: pd.DataFrame, root: Path, name: str) -> str:
 def write_s3(df: pd.DataFrame, cfg: dict, name: str) -> str:
     import boto3
 
+    s3 = boto3.client("s3", region_name=cfg["region"])
+    prefix = f"gold/{name}/"
+    removed = _clear_prefix(s3, cfg["bucket"], prefix)
+    if removed:
+        print(f"  cleared {removed} stale object(s) under {prefix}")
+
     buf = io.BytesIO()
     df.to_parquet(buf, index=False)
-    key = f"gold/{name}/part-000.parquet"
-    boto3.client("s3", region_name=cfg["region"]).put_object(
-        Bucket=cfg["bucket"], Key=key, Body=buf.getvalue()
-    )
+    key = f"{prefix}part-000.parquet"
+    s3.put_object(Bucket=cfg["bucket"], Key=key, Body=buf.getvalue())
     return f"s3://{cfg['bucket']}/{key}"
 
 
