@@ -86,6 +86,33 @@ def read_bronze(bronze_root: Path) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
+def read_bronze_s3(cfg: dict, prefix: str = "bronze/") -> pd.DataFrame:
+    """
+    Same read, against S3. A paginator is required because list_objects_v2
+    returns at most 1000 keys per call — a lakehouse outgrows that quickly
+    and the silent truncation is a classic bug.
+    """
+    import boto3
+
+    s3 = boto3.client("s3", region_name=cfg["region"])
+    bucket = cfg["bucket"]
+
+    rows = []
+    for page in s3.get_paginator("list_objects_v2").paginate(Bucket=bucket, Prefix=prefix):
+        for obj in page.get("Contents", []):
+            if not obj["Key"].endswith(".json"):
+                continue
+            body = s3.get_object(Bucket=bucket, Key=obj["Key"])["Body"].read().decode("utf-8")
+            for line in body.splitlines():
+                line = line.strip()
+                if line:
+                    rows.append(json.loads(line))
+
+    if not rows:
+        raise SystemExit(f"no bronze objects under s3://{bucket}/{prefix}")
+    return pd.DataFrame(rows)
+
+
 # --------------------------------------------------------------------------
 # parse + validate
 # --------------------------------------------------------------------------
@@ -223,15 +250,50 @@ def write_partitioned(df: pd.DataFrame, out_root: Path, name: str) -> int:
     return written
 
 
+def write_partitioned_s3(df: pd.DataFrame, cfg: dict, name: str) -> int:
+    """
+    Same layout on S3. The key is deterministic (silver/<name>/event_dt=X/
+    part-000.parquet) so a re-run REPLACES the partition rather than adding
+    a second file — the same idempotency rule bronze uses.
+    """
+    import io
+
+    import boto3
+
+    if df.empty:
+        return 0
+
+    s3 = boto3.client("s3", region_name=cfg["region"])
+    written = 0
+
+    for event_dt, part in df.groupby("event_dt"):
+        buf = io.BytesIO()
+        part.drop(columns=["event_dt"]).to_parquet(buf, index=False)
+        s3.put_object(
+            Bucket=cfg["bucket"],
+            Key=f"silver/{name}/event_dt={event_dt}/part-000.parquet",
+            Body=buf.getvalue(),
+        )
+        written += 1
+    return written
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="bronze -> silver")
     parser.add_argument("--bronze", type=Path, default=DATA_DIR / "bronze")
     parser.add_argument("--out", type=Path, default=DATA_DIR / "silver")
+    parser.add_argument("--source", choices=["local", "s3"], default="local")
+    parser.add_argument("--sink", choices=["local", "s3"], default="local")
     args = parser.parse_args()
 
     cfg = load_config()
 
-    bronze = read_bronze(args.bronze)
+    if args.source == "s3":
+        bronze = read_bronze_s3(cfg)
+        print(f"source                     : s3://{cfg['bucket']}/bronze/")
+    else:
+        bronze = read_bronze(args.bronze)
+        print(f"source                     : {args.bronze}")
     print(f"bronze records read        : {len(bronze):,}")
 
     good, bad = parse_and_validate(bronze, cfg)
@@ -250,15 +312,33 @@ def main() -> None:
     payments = good[good["event_type"] == "PAYMENT_RECEIVED"].copy()
     invoices = good[good["event_type"] == "INVOICE_CLEARED"].copy()
 
-    p_parts = write_partitioned(payments, args.out, "payments")
-    i_parts = write_partitioned(invoices, args.out, "invoices")
+    if args.sink == "s3":
+        p_parts = write_partitioned_s3(payments, cfg, "payments")
+        i_parts = write_partitioned_s3(invoices, cfg, "invoices")
+        if not bad.empty:
+            import io
 
-    if not bad.empty:
-        q_dir = args.out / "quarantine"
-        q_dir.mkdir(parents=True, exist_ok=True)
-        bad.to_parquet(q_dir / "part-000.parquet", index=False)
+            import boto3
 
-    print(f"\npayments  : {len(payments):,} rows across {p_parts} event_dt partitions")
+            buf = io.BytesIO()
+            bad.to_parquet(buf, index=False)
+            boto3.client("s3", region_name=cfg["region"]).put_object(
+                Bucket=cfg["bucket"],
+                Key="silver/quarantine/part-000.parquet",
+                Body=buf.getvalue(),
+            )
+        target = f"s3://{cfg['bucket']}/silver/"
+    else:
+        p_parts = write_partitioned(payments, args.out, "payments")
+        i_parts = write_partitioned(invoices, args.out, "invoices")
+        if not bad.empty:
+            q_dir = args.out / "quarantine"
+            q_dir.mkdir(parents=True, exist_ok=True)
+            bad.to_parquet(q_dir / "part-000.parquet", index=False)
+        target = str(args.out)
+
+    print(f"\nsink      : {target}")
+    print(f"payments  : {len(payments):,} rows across {p_parts} event_dt partitions")
     print(f"invoices  : {len(invoices):,} rows across {i_parts} event_dt partitions")
 
     if not bad.empty:
