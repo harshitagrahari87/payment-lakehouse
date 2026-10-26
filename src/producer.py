@@ -38,6 +38,7 @@ from __future__ import annotations
 import argparse
 import json
 import random
+import time
 import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -225,6 +226,58 @@ def write_local(events: list[dict], truth: dict, out_dir: Path) -> None:
     print(f"wrote answer key      -> {truth_path}")
 
 
+def write_kinesis(events: list[dict], cfg: dict) -> None:
+    """
+    PartitionKey = payment_id.
+
+    Kinesis hashes the partition key to pick a shard, and guarantees order
+    only WITHIN a shard. Keying on payment_id puts a payment and its invoice
+    on the same shard, so they arrive in the order they were produced.
+    Keying on event_id would scatter them and lose that guarantee.
+
+    PutRecords takes at most 500 records / 5 MB per call, and can partially
+    fail — FailedRecordCount > 0 with the rest succeeding. Those records must
+    be resent or they are simply lost; a 200 response does NOT mean every
+    record landed.
+    """
+    import boto3
+
+    client = boto3.client("kinesis", region_name=cfg["region"])
+    stream = cfg["stream_name"]
+
+    sent = retried = 0
+    for start in range(0, len(events), 500):
+        chunk = [
+            {"Data": json.dumps(e).encode("utf-8"),
+             "PartitionKey": str(e.get("payment_id") or e.get("event_id"))}
+            for e in events[start:start + 500]
+        ]
+
+        for attempt in range(5):
+            response = client.put_records(StreamName=stream, Records=chunk)
+            failed = response.get("FailedRecordCount", 0)
+            if not failed:
+                break
+            # Resend ONLY the records that failed, preserving order within
+            # the retry. Resending the whole chunk would duplicate the ones
+            # that already succeeded.
+            chunk = [
+                rec for rec, result in zip(chunk, response["Records"])
+                if result.get("ErrorCode")
+            ]
+            retried += failed
+            time.sleep(0.5 * (2 ** attempt))
+        else:
+            raise SystemExit(f"{len(chunk)} records still failing after 5 attempts")
+
+        sent += len(events[start:start + 500])
+        print(f"  sent {sent:,}/{len(events):,}", end="\r")
+
+    print(f"\nsent {sent:,} records -> kinesis:{stream} ({cfg['region']})")
+    if retried:
+        print(f"  {retried} records were throttled and resent")
+
+
 def summarise(truth: dict) -> None:
     t = truth
     received = t["payments_generated"]
@@ -259,11 +312,18 @@ def main() -> None:
     parser.add_argument("--count", type=int, default=5000, help="number of payments")
     parser.add_argument("--seed", type=int, default=42, help="RNG seed; same seed = same data")
     parser.add_argument("--out", type=Path, default=DATA_DIR, help="output directory")
+    parser.add_argument("--sink", choices=["local", "kinesis"], default="local")
     args = parser.parse_args()
 
     cfg = load_config()
     events, truth = generate(cfg, args.count, args.seed)
+
+    # The answer key is always written locally — it is what every downstream
+    # reconciliation is checked against.
     write_local(events, truth, args.out)
+    if args.sink == "kinesis":
+        write_kinesis(events, cfg)
+
     summarise(truth)
 
 
