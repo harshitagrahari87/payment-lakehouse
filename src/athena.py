@@ -148,13 +148,21 @@ def cmd_bench(athena: Athena) -> None:
     gold_star = dict(results)["SELECT * — GOLD (pruning defeated)"]
 
     print("\n--- what the numbers say ---")
-    if gold_count:
+    if gold_count == 0:
+        print(f"  count(*) JSON scanned {human(bronze_count)}, Parquet scanned 0 B.")
+        print("  Parquet stores row counts in the FILE FOOTER, so Athena answers")
+        print("  count(*) from metadata without opening a data page. JSON has no")
+        print("  footer and no statistics — it must parse every byte.")
+    else:
         print(f"  JSON vs Parquet, same question : {bronze_count / gold_count:>6.1f}x fewer bytes")
+
     if gold_two_col:
-        print(f"  2 columns vs SELECT *          : {gold_star / gold_two_col:>6.1f}x fewer bytes")
-    print("\n  Athena bills a 10 MB minimum per query, so at this volume every")
-    print("  query costs the same. The RATIO is what scales — at 3 years of data")
-    print("  it is the difference between a cent and a dollar per query.")
+        print(f"\n  2 columns vs SELECT *          : {gold_star / gold_two_col:>6.1f}x fewer bytes")
+        print("  SELECT * defeats columnar storage entirely.")
+
+    print("\n  Athena bills a 10 MB MINIMUM per query, so at this volume every")
+    print("  query costs the same. The RATIO is what scales — at 3 years of")
+    print("  production data it is cents vs dollars per analyst query.")
 
 
 def main() -> None:
