@@ -1,298 +1,221 @@
 # Failure Log
 
-> Every error, how it was diagnosed, what fixed it.
-> This is the most valuable file in the repo — it is the answer to
-> *"tell me about a time you debugged something in production."*
+Problems hit while building this, how each was diagnosed, and what fixed it.
+Kept because the diagnosis is usually more useful than the fix.
 
 ---
 
-## #1 — Leaked an IAM secret access key into a chat log
+## 1. Secret access key exposed
 
-**Date:** Oct 25, 2026
-**Severity:** Critical (credential exposure, `AdministratorAccess`)
+**Severity:** critical — credential exposure on a role with administrator access
 
-**What happened**
-While sharing terminal output, I pasted the full `aws configure` session — which
-echoed the **Secret Access Key** in plain text. An `AKIA...` key with admin rights
-is the single most-scraped credential type on the internet; compromised keys are
-typically exploited for crypto mining within hours of exposure.
+An `aws configure` session was captured in a context that echoed the secret
+access key in plain text. Keys matching `AKIA...` are scraped aggressively and
+exploited within hours.
 
-**How it was caught**
-Immediately, on review of the pasted output. No automated control caught it —
-that is itself a finding.
+Rotated immediately:
 
-**Fix (executed within ~2 minutes)**
 ```bash
-aws iam create-access-key  --user-name de-projects          # 1. mint replacement
-aws configure                                                # 2. repoint the CLI
-aws sts get-caller-identity                                  # 3. prove new key works
-aws iam update-access-key  --user-name de-projects \
-    --access-key-id <OLD> --status Inactive                  # 4. deactivate old
-aws sts get-caller-identity                                  # 5. prove still working
-aws iam delete-access-key  --user-name de-projects \
-    --access-key-id <OLD>                                    # 6. delete old
-aws iam list-access-keys   --user-name de-projects           # 7. verify exactly 1 key
+aws iam create-access-key --user-name <user>          # mint replacement
+aws configure                                          # repoint the CLI
+aws sts get-caller-identity                            # confirm new key works
+aws iam update-access-key --user-name <user> \
+    --access-key-id <OLD> --status Inactive            # deactivate
+aws sts get-caller-identity                            # confirm still working
+aws iam delete-access-key --user-name <user> \
+    --access-key-id <OLD>                              # delete
+aws iam list-access-keys --user-name <user>            # verify one key remains
 ```
 
-**Verification of blast radius**
-```bash
-aws ce get-cost-and-usage --time-period Start=2026-10-01,End=2026-10-26 \
-    --granularity MONTHLY --metrics UnblendedCost
-# -> $0.00  — no unauthorised usage
-```
+Deactivate before delete: deactivation is reversible and revokes the
+credential instantly, so if something still depended on the old key the
+failure surfaces while rollback is still possible.
 
-**Why deactivate before delete**
-Deactivating is reversible and instantly revokes the credential. If anything had
-still depended on the old key, the failure would have surfaced while rollback was
-still possible. Deleting first makes the rollback path disappear.
+Blast radius checked with Cost Explorer — no usage.
 
-**Root cause**
-No separation between "output I read" and "output I share". The secret was only
-ever on screen because `aws configure` echoes input.
+**Controls added**
 
-**Preventive controls added**
-1. `.gitignore` blocks `*credentials*.csv`, `.env`, `*.pem`, `.aws/` — written
-   before the first line of application code existed.
-2. Never retype or echo a secret; `aws configure` is run once and the credential
-   lives only in `~/.aws/credentials`.
-3. Access Key **ID** is semi-public and safe to show. The **Secret** is shown to
-   no one, ever.
+- `.gitignore` covers `*credentials*.csv`, `.env`, `*.pem`, `.aws/`, written
+  before the first line of application code.
+- The access key **ID** is safe to show; the **secret** is never echoed,
+  logged or committed.
 
-**Hardening still owed**
-- Replace `AdministratorAccess` on `de-projects` with a least-privilege policy
-  scoped to S3 / Glue / Kinesis / Lambda / Athena once resource ARNs are known.
-- Enable CloudTrail and alarm on `ConsoleLogin` + IAM mutations.
-- Treat the $10 budget alarm as the backstop, not the control.
+**Still owed:** replace the administrator policy with a least-privilege one
+scoped to S3, Glue, Kinesis, Lambda and Athena.
 
 ---
 
-## #2 — `AdministratorAccess` returned AccessDenied
+## 2. Administrator access denied by a service control policy
 
-**Date:** Oct 25, 2026
-**Severity:** Blocker — no AWS resources could be created
+**Severity:** blocker — no resources could be created
 
-**Symptom**
 ```
-aws s3api create-bucket --bucket payment-lakehouse-... --region ap-south-1
-
-AccessDenied: User: arn:aws:iam::569854554172:user/de-projects is not
-authorized to perform: s3:CreateBucket ... with an explicit deny in a
-service control policy: .../p-sngva019
+AccessDenied: User ... is not authorized to perform: s3:CreateBucket
+with an explicit deny in a service control policy
 ```
+
 The IAM user had `AdministratorAccess` attached.
 
-**Reading the error**
-The message named a **service control policy**, not an IAM policy. That
-settles the layer immediately:
+The error names a **service control policy**, not an IAM policy, which
+identifies the layer immediately. An SCP is a ceiling on a member account;
+IAM grants operate inside that ceiling, and an explicit deny in an SCP cannot
+be overridden by any IAM policy. No amount of IAM work would have helped.
 
-```
-SCP        a permissions CEILING on a member account
-IAM        a permissions GRANT within that ceiling
-Evaluation explicit Deny  >  Allow  >  implicit deny
-```
-An explicit `Deny` in an SCP cannot be overridden by any IAM policy, managed
-or inline. So no amount of IAM work would ever fix this — the wrong layer was
-being looked at.
+**Diagnosis**
 
-**Diagnosis — narrowing by controlled comparison**
+| Test | Result |
+|---|---|
+| Same call from CloudShell under a different role | succeeded — so not account-wide |
+| `sts:AssumeRole` from the IAM user | denied by the same policy |
+| Custom role created, then assumed | denied |
+| `s3:CreateBucket` from the working role | denied |
+| Plan tier upgraded | restriction persisted |
 
-| # | Test | Result | Eliminated |
-|---|---|---|---|
-| 1 | KYC status on the account | Verification **Failed** | fixed it — address on file was Hyderabad, PAN record is Kanpur. Re-verified with PAN. Restriction persisted, so KYC was not the cause |
-| 2 | Same call from **CloudShell** (`AccountFullAccessRole`) | `s3 ls` **succeeded** | account-wide deny — the restriction is **principal-scoped** |
-| 3 | `sts:AssumeRole` from the IAM user | denied by the same SCP | the user cannot escape into a role |
-| 4 | Created a custom role, tried to assume it | denied | not specific to the AWS-managed role |
-| 5 | `s3:CreateBucket` from CloudShell | **denied** | principal-scoped theory — this action is denied for *everyone* |
-| 6 | Upgraded Free Plan → Paid Plan (+ $20 hard spend limit) | restriction persisted | plan tier alone |
+Conclusion: the deny was both principal-scoped and action-scoped, and
+originated from a managed account restriction rather than a misconfiguration.
 
-**Conclusion**
-`s3:ListAllMyBuckets` is permitted for the managed role but denied for IAM
-users, while `s3:CreateBucket` is denied for **every** principal. The deny is
-therefore both **principal-scoped and action-scoped** — an AWS-applied
-restriction on this account model, not a misconfiguration.
+The real cause turned out to be region-scoped. See #4.
 
-**Resolution**
-Support case `179293343000299` (Account and Billing — free on every plan),
-quoting the policy id and the exact denied actions so it routes correctly.
-
-**The option deliberately NOT taken**
-Activating AWS Organizations advanced features would have allowed the SCPs to
-be removed — and the console stated plainly that it **deletes spend limits**
-and **cannot be reversed**. Trading an irreversible loss of a hard cost control
-for a problem with a free support path is a bad trade. Deferred pending the
-support response, and if it ever becomes necessary, Budgets alerts get
-configured *first*. You do not remove a control and leave nothing in its place.
-
-**Takeaways**
-1. Read *which layer* an AccessDenied names. SCP, IAM, resource policy and
-   permissions boundary fail in different places and have different fixes.
-2. Isolate with a controlled comparison: same action, same account, different
-   principal. One CloudShell call eliminated three hypotheses at once.
-3. Never work around a guardrail. Fix it at its source or escalate.
+**Not done:** removing the policies would have required activating an
+irreversible org feature that also deletes the account's spend limit.
+Declining to remove a cost control in order to unblock a problem that was not
+yet understood was the right call — and the actual cause made it unnecessary.
 
 ---
 
-## #3 — A re-ingestion doubled the quarantine count, and the job reported SUCCESS
+## 3. A re-ingestion doubled the rejected count, and the job reported success
 
-**Date:** Oct 25, 2026
-**Severity:** Silent data-quality defect — no error, no alert, wrong numbers
+**Severity:** silent data quality defect — no error, no alert, wrong numbers
 
-**What happened**
-`bronze_writer.py` was run twice. The object key is a deterministic hash of
-the batch's `event_id`s, so the second run should have overwritten the first.
-It did not: the key embeds the **ingest hour**, and the two runs fell in
-different hours.
+The bronze writer ran twice. The object key is a hash of the batch contents,
+so the second run should have overwritten the first. It did not: the key path
+includes the ingest hour, and the two runs fell in different hours.
 
 ```
-data/bronze/ingest_dt=2026-10-25/hour=12/  95 files
-data/bronze/ingest_dt=2026-10-25/hour=13/  95 files   <- every event, twice
+bronze/ingest_dt=.../hour=12/   95 files
+bronze/ingest_dt=.../hour=13/   95 files   — every event, twice
 ```
 
-Silver then read 18,892 records instead of 9,446 and reported:
-```
-quarantined : 126      expected : 63
-unique      : 9,321    expected : 9,258
-```
+Silver then read double the records and reported 126 quarantined against an
+expected 63.
 
-**Why it was not caught by the job**
-It ran to completion. Exit code 0. No exception, no warning. Valid records
-were deduplicated on `event_id`; **quarantined records were not.** Dedup ran
-only on the good branch after the good/bad split, so both copies of every
-malformed record were written.
+**Why nothing caught it**
 
-Only the reconciliation against the producer's answer key exposed it, and the
-discrepancy was exactly 63 — the duplicated rejects.
+The job completed with exit code 0. Valid records were deduplicated on
+`event_id`; quarantined records were not, because deduplication ran only on
+the good branch after the split. Only the reconciliation against known totals
+exposed it, and the discrepancy was exactly the number of duplicated rejects.
 
-**Fix**
-`dedup_quarantine()` — same first-arrival-per-`event_id` rule, falling back to
-the raw bytes for records too malformed to carry an `event_id`.
-
-Result with the doubled input unchanged at 18,892 records in:
-```
-silver records : 9,195   quarantine : 63
-unique 9,258 = 9,258  ✓      quarantined 63 = 63  ✓
-```
+**Fix:** `dedup_quarantine()`, applying the same first-arrival rule and
+falling back to the raw bytes for records too malformed to carry an event_id.
 
 **Takeaways**
-1. **Quarantine is a table.** It needs the same idempotency guarantees as the
-   happy path. A duplicated reject corrupts the rejected total, and therefore
-   the daily reconciliation.
-2. **A deterministic key is only as deterministic as everything in it.** The
-   hour component silently broke the guarantee across partitions — which is
-   precisely why event-level dedup in silver is a second, independent defence
+
+1. Quarantine is a table and needs the same idempotency guarantees as the
+   happy path. A duplicated reject corrupts the rejected total.
+2. A deterministic key is only as deterministic as everything inside it. The
+   hour component broke the guarantee across partitions, which is why
+   event-level deduplication downstream is a second independent defence
    rather than redundancy.
-3. **Success is not correctness.** The job succeeded while producing wrong
-   numbers. Only a control total against a known figure catches that class of
-   bug, and it is the reason the generator emits an answer key at all.
+3. Success is not correctness. Only a control total against a known figure
+   catches this class of bug.
 
 ---
 
-## #4 — Three hours lost because I never varied the region
+## 4. Three hours lost because the region was never varied
 
-**Date:** Oct 25, 2026
-**Severity:** Blocker — believed to be a service ban, was a region restriction
+**Severity:** blocker — believed to be a service restriction, was a region one
 
-**What I believed**
-Every AWS data service was denied on the account:
+Every data service appeared to be denied:
+
 ```
-s3:CreateBucket        DENIED
-kinesis:ListStreams    DENIED
-glue:GetDatabases      DENIED
-lambda:ListFunctions   DENIED
-athena:ListWorkGroups  DENIED
+s3:CreateBucket        denied
+kinesis:ListStreams    denied
+glue:GetDatabases      denied
+lambda:ListFunctions   denied
+athena:ListWorkGroups  denied
 ```
-All five carried an explicit deny from SCP `p-sngva019`. The conclusion drawn
-was that the account's plan blocked the analytics stack entirely.
 
-**What was actually true**
-The account is restricted to **one region: `ap-southeast-2`**. Every failing
-call had been made against `ap-south-1` or `us-east-1`.
+All five carried an explicit deny from the same policy, which led to the
+conclusion that the analytics stack was blocked outright.
 
-**The clue that was present the entire time**
-`aws s3 ls` **succeeded** throughout. `ListAllMyBuckets` is a *global*
-endpoint and carries no region. Every call that failed carried an explicit
-`--region`. CloudShell had also defaulted to `ap-southeast-2` from the start.
+**What was actually true:** the account is restricted to a single region. Every
+failing call had been made against two other regions.
 
-**The diagnostic error**
-Three hypotheses were tested by varying **principal** (IAM user -> custom role
--> AWS-managed role) and **action** (S3 -> Kinesis -> Glue -> Lambda -> Athena).
-**Region was never varied** — it was treated as fixed context rather than as a
-parameter. One call to `lambda:ListFunctions --region ap-southeast-2` returned
-`{"Functions": []}` and the whole picture inverted.
+**The clue that was present throughout:** `aws s3 ls` succeeded the entire
+time. `ListAllMyBuckets` is a global endpoint and carries no region; every
+call that failed carried an explicit `--region`. CloudShell had also defaulted
+to the permitted region from the start.
 
-**Cost of the error**
-~3 hours. Also prompted a Paid Plan upgrade that was probably unnecessary —
-the Athena `primary` workgroup in `ap-southeast-2` was created at 09:02 UTC,
-three hours *before* the upgrade, so the region was already live on the Free
-Plan. The upgrade did buy a $20 hard spend limit, which is a real control, so
-it was not wasted.
+**The diagnostic error:** three hypotheses were tested by varying *principal*
+(IAM user, custom role, managed role) and *action* (five different services).
+Region was treated as fixed context rather than as a variable. One call to
+`lambda:ListFunctions` in the permitted region returned successfully and
+inverted the whole picture.
 
-**What was correctly refused**
-Activating AWS Organizations advanced features would have allowed the SCPs to
-be deleted. The console stated it **removes spend limits** and **cannot be
-reversed**. Declining an irreversible removal of a cost control, to solve a
-problem that had a free support path, was the right call — and the region
-discovery made it moot.
+**Takeaways**
+
+1. An AccessDenied has four dimensions — principal, action, resource, and
+   condition (region, tags, source IP). Vary one at a time. Eliminating three
+   principals and five services proved nothing, because the real discriminator
+   was never under test.
+2. A call that succeeds is as informative as one that fails. `s3 ls` working
+   should have prompted the question "what is different about that call?"
 
 ---
 
-## #5 — PutRecords returned HTTP 200 and lost 639 records
+## 5. PutRecords returned HTTP 200 and dropped 639 records
 
-**Date:** Oct 26, 2026
-**Severity:** Would have been silent data loss
+**Severity:** would have been silent data loss
 
-**What happened**
-The producer sent 9,446 events to a single-shard Kinesis stream as fast as the
-API allowed. Every `PutRecords` call returned **HTTP 200**. Inside those
-successful responses, **639 records carried `ErrorCode:
-ProvisionedThroughputExceededException`**.
+9,446 events were sent to a single-shard stream as fast as the API allowed.
+Every `PutRecords` call returned HTTP 200. Inside those responses, **639
+records carried `ProvisionedThroughputExceededException`**.
 
 A shard accepts 1,000 records/sec or 1 MB/sec. The producer exceeded the
-record ceiling, and Kinesis rejected the excess **per record**, not per call.
+record ceiling, and Kinesis rejected the excess per record, not per call.
 
-**Why this is dangerous**
 ```python
-response = client.put_records(...)   # 200 OK
-# done, right?
+response = client.put_records(...)   # 200 OK, and incomplete
 ```
-Nothing raises. No exception, no non-2xx status. A producer that checks only
-the HTTP status silently drops records, and the loss is invisible until
-someone reconciles totals — which most pipelines never do.
+
+Nothing raises. A producer that checks only the HTTP status drops records
+silently, and the loss is invisible until someone reconciles totals.
 
 **Fix**
+
 ```python
 failed = response["FailedRecordCount"]
 if failed:
-    # resend ONLY the failed subset. Resending the whole chunk would
-    # duplicate the records that already succeeded.
+    # resend only the failed subset; resending the whole chunk would
+    # duplicate the records that already succeeded
     chunk = [rec for rec, result in zip(chunk, response["Records"])
              if result.get("ErrorCode")]
 ```
-with exponential backoff, up to 5 attempts.
 
-**Verification**
-All 9,446 records reached bronze, and silver/gold reconciled exactly to the
-answer key (9,258 unique / 63 quarantined / 4,115 matched). Had the 639 been
-dropped, the control total would have failed by that amount.
+with exponential backoff, up to five attempts. All 9,446 records subsequently
+reached bronze and reconciled exactly.
+
+**Takeaways**
+
+1. `PutRecords` is a partial-failure API, as are DynamoDB `BatchWriteItem`
+   (`UnprocessedItems`) and SQS `SendMessageBatch` (`Failed`). HTTP 200 means
+   the call succeeded, not that every item did.
+2. Resend the failed subset, never the whole batch.
+3. Throttling is expected behaviour for a correctly sized shard under burst.
+   Backpressure is the producer's responsibility.
 
 ---
 
-## #6 — Two writers, one prefix: Athena double-counted everything
+## 6. Two writers, one prefix — every count doubled
 
-**Date:** Oct 26, 2026
-**Severity:** Silent — both jobs reported SUCCESS, the table was wrong
+**Severity:** silent — both jobs reported success, the table was wrong
 
-**What happened**
-The Glue/PySpark job and the pandas job were both run against `gold/`. Each
-printed a correct, internally-consistent control total. Athena then returned:
+The Spark and pandas implementations were both run against `gold/`. Each
+printed a correct, internally consistent control total. Athena then returned
+roughly double every figure.
 
-```
-Athena    MATCHED 8,230   PENDING 946   EXPIRED 412   MISMATCH 286
-gold_job  MATCHED 4,115   PENDING 487   EXPIRED 192   MISMATCH 143
-```
-
-**Root cause**
-The two writers use different file-naming conventions:
+**Cause:** the two writers use different file-naming conventions.
 
 ```
 part-00000-<uuid>-c000.snappy.parquet    Spark
@@ -300,74 +223,58 @@ part-000.parquet                          pandas / pyarrow
 ```
 
 Spark's `mode("overwrite")` removed the files it knew about; the pandas job
-then `put_object`'d its own key alongside. Neither deleted the other.
+then wrote its own key alongside. Neither removed the other, and a Hive-style
+external table is defined by whatever files sit under the prefix — so Athena
+read both sets and summed them.
 
-**A Hive-style external table is "whatever files are under the prefix."**
-Athena read both sets and summed them.
+The counts were not exactly double because the two runs used different `as_of`
+values, so a number of payments had moved from PENDING to EXPIRED between
+them. Same payments, two snapshots, both live in the table at once.
 
-The counts were not exactly 2x because the two runs used different `as_of`
-values — 28 payments had crossed from PENDING to EXPIRED between them. Same
-payments, two snapshots, both live in the table simultaneously.
+**Why the reconciliation gate missed it:** each job validated its own
+DataFrame in memory. Both were correct. Nothing validated the state of the
+table afterwards.
 
-**Why the reconciliation gate did not catch it**
-Each job validated **its own DataFrame in memory**. Both were correct.
-Nothing validated the state of the **table** afterwards.
+**Fix:** both S3 writers now clear their prefix before writing.
 
-> A control total on your output is not a control total on the table.
-
-**Fix**
-Both S3 writers now clear their prefix (paginated `list_objects_v2` ->
-`delete_objects`) before writing. The writer owns its prefix.
-
-**The real lesson — this is why Iceberg and Delta exist**
-A Hive table is defined by directory listing. A table format is defined by a
-**transaction log** that names exactly which files constitute the current
-snapshot. Under Iceberg, a stray file written by another process is simply
-not part of the table, and `overwrite` is an atomic commit rather than a
-sequence of deletes and puts that another writer can interleave with.
-
-This is no longer a textbook argument — it is a bug reproduced on this data.
+**The structural lesson.** A Hive-style table is defined by directory listing;
+a table format is defined by a transaction log naming exactly which files
+constitute the current snapshot. Under Iceberg or Delta a stray file written
+by another process is simply not part of the table, and an overwrite is an
+atomic commit rather than a sequence of deletes and puts that another writer
+can interleave with. Migrating gold to Iceberg is the next change.
 
 **Takeaways**
-1. **Two writers in one prefix is a correctness bug**, not an untidiness
-   issue. It needs a table format or an exclusive-writer guarantee.
-2. **`overwrite` only removes what the writer knows about.** It is not a
+
+1. Two writers in one prefix is a correctness bug, not an untidiness issue.
+2. `overwrite` removes only what the writer knows about; it is not a
    directory truncation.
-3. Validate the **table**, not just the DataFrame. The gate should read back
-   from the target after writing — that is the only check that would have
-   caught this.
+3. Validate the table, not just the DataFrame. A gate that reads back from
+   the target after writing would have caught this.
 
 ---
 
-## #7 — Reconciliation failed because the answer key was newer than the data
+## 7. Reconciliation failed because the fixture and its expectations diverged
 
-**Date:** Oct 26, 2026
-**Severity:** Low — false alarm, but it cost time
+**Severity:** low — false alarm, but it cost time
 
-**Symptom**
 ```
 PENDING   expected 487   actual 449
 EXPIRED   expected 192   actual 230
 ```
-38 payments had moved from PENDING to EXPIRED. MATCHED, MISMATCH and
+
+38 payments had moved between the two states. MATCHED, AMOUNT_MISMATCH and
 REJECTED all matched exactly.
 
-**Cause**
-`data/bronze/` held events generated on Oct 25. `_expected_totals.json` had
-been regenerated on Oct 26. The producer anchors `event_ts` to `now()`, so
-**the same `--seed` does not produce the same timestamps on a different day**
-— only the same random *choices*.
+**Cause:** the bronze data had been generated on one day and the expected
+totals regenerated on the next. The generator anchors `event_ts` to the
+current time, so the same `--seed` reproduces the same random *choices* but
+not the same absolute timestamps.
 
-The pipeline was correct. The answer key described a different dataset.
+The pipeline was correct; the expectations described a different dataset.
 
-**Fix**
-Regenerate the whole chain together: producer -> bronze -> silver -> gold.
+**Fix:** regenerate the whole chain together.
 
-**Takeaway**
-`--seed` makes the random decisions reproducible, not the absolute timestamps.
-A fixture and the expectations derived from it are **one artifact** and must
-be regenerated as a unit. The state machine is time-dependent by design, so
-only MATCHED and REJECTED are time-invariant — which is exactly why PENDING
-and EXPIRED were the two that drifted.
-
----
+**Takeaway:** a fixture and the expectations derived from it are one artifact
+and must be regenerated as a unit. Only the time-invariant states matched —
+which is precisely why PENDING and EXPIRED were the two that drifted.

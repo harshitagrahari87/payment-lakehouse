@@ -1,54 +1,24 @@
 """
-gold_job.py — silver -> gold. The business logic.
+silver -> gold.
 
-Everything before this moved and cleaned data. This decides what the data
-MEANS: has a payment been matched to its invoice, is it still waiting, or has
-it run out of time?
+Matches payments to invoices, applies the per-region retry window and derives
+the current state of every payment:
 
-
-THE STATE MACHINE
------------------
     PAYMENT_RECEIVED
-          |
-          +-- invoice found, amounts agree ----------> MATCHED
-          |
-          +-- invoice found, amounts differ ---------> AMOUNT_MISMATCH
-          |                                            (matched, but flagged
-          |                                             for finance to review)
-          +-- no invoice yet
-                   |
-                   +-- within the region's retry window --> PENDING
-                   |
-                   +-- past the window -------------------> EXPIRED
-                                                            (exception report)
+        invoice found, amounts agree    -> MATCHED
+        invoice found, amounts differ   -> AMOUNT_MISMATCH
+        no invoice, inside the window   -> PENDING
+        no invoice, past the window     -> EXPIRED
 
-The retry window is per REGION and lives in conf/config.json, not in code,
-because clearance times differ by country and the business changes them
-without a deploy. US = 3 days, AE = 10.
+The retry window is per region and read from conf/config.json, since
+clearance times differ by country and change without a deploy.
 
+as_of is a parameter. Whether a payment is PENDING or EXPIRED depends on the
+date the question is asked, so using wall-clock time would make a rerun of an
+earlier period produce today's answer instead of that period's.
 
-WHY as_of IS A PARAMETER AND NEVER datetime.now()
--------------------------------------------------
-Whether a payment is PENDING or EXPIRED depends on the date you ask. Using
-now() means re-running yesterday's report today produces different numbers,
-and a backfill silently rewrites history.
-
-This is the same idempotency rule as Airflow's logical_date:
-    "templates use the LOGICAL date, never datetime.now()"
-Pass the date in. Then the job is reproducible and a backfill is safe.
-
-
-THE CONTROL TOTAL
------------------
-    received = MATCHED + AMOUNT_MISMATCH + PENDING + EXPIRED + REJECTED
-
-If that does not balance, the pipeline lost or invented money. It is checked
-here, and it is the reason the generator emits an answer key.
-
-
-OUTPUTS
--------
-    gold/fct_payment_state/      one row per payment_id   (current state)
+Outputs:
+    gold/fct_payment_state/      one row per payment
     gold/dim_region/             retry windows and currency
     gold/reconciliation_daily/   counts by payment date and region
 
@@ -132,10 +102,9 @@ def build_payment_state(
                 .rename(columns={"amount": "invoice_amount", "event_ts": "invoice_ts"})
     )
 
-    # Select explicitly. Silver builds payments and invoices from the same
-    # union of columns, so the payments frame carries an all-null invoice_id.
-    # Merging without this produces invoice_id_x / invoice_id_y and the
-    # downstream lookup fails. Never inherit a schema you did not declare.
+    # Columns selected explicitly: silver builds payments and invoices from the
+    # same union of fields, so the payments frame carries an all-null
+    # invoice_id that collides with the joined one.
     pay = payments.loc[:, [
         "payment_id", "customer_id", "region", "currency",
         "amount", "payment_method", "event_ts",
@@ -229,20 +198,11 @@ def build_reconciliation_daily(fct: pd.DataFrame) -> pd.DataFrame:
 
 def _clear_prefix(s3, bucket: str, prefix: str) -> int:
     """
-    Delete everything under a prefix before writing.
+    Removes everything under a prefix before writing.
 
-    Why this is necessary: a Hive-style table is "whatever files are in the
-    directory". Two writers with different file-naming conventions — Spark's
-    part-00000-<uuid>-c000.snappy.parquet and this job's part-000.parquet —
-    will happily coexist, and Athena will read BOTH and double every count.
-
-    Neither job notices: each one validates its own DataFrame, and both are
-    internally correct. The table is what is wrong.
-
-    This is precisely what Iceberg/Delta solve. Their transaction log names
-    the files that constitute the current snapshot, so a stray file written
-    by another process is simply not part of the table. With plain Parquet
-    the writer has to own its prefix explicitly.
+    A Hive-style table is defined by the files under its prefix. This job and
+    the Spark version use different filenames, so without clearing, both sets
+    remain and queries read the union of them.
     """
     deleted = 0
     for page in s3.get_paginator("list_objects_v2").paginate(Bucket=bucket, Prefix=prefix):

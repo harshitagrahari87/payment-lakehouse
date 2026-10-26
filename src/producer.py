@@ -1,36 +1,29 @@
 """
-producer.py — synthetic payment + invoice event generator.
+Synthetic payment and invoice event generator.
 
-WHY THIS FILE EXISTS
---------------------
-The pipeline's job is not to move clean data. It is to survive dirty data and
-still produce a reconciliation report that balances. So the generator injects
-defects on purpose, and records the ground truth it injected, so every
-downstream control can be checked against an answer key.
+Emits events with deliberate defects — duplicates, late invoices, malformed
+records, an uneven regional distribution and amounts that do not match — and
+records what it injected so downstream output can be checked against a known
+answer rather than eyeballed.
 
-THE TWO IDENTIFIERS — do not collapse them
-------------------------------------------
-    event_id    unique per MESSAGE   -> the idempotency key. Dedup on this.
-    payment_id  unique per PAYMENT   -> the business key. Group on this.
+Two identifiers, two jobs:
+    event_id    unique per message. The deduplication key.
+    payment_id  unique per payment. The business key.
+A redelivery repeats event_id; a correction reuses payment_id with a new
+event_id and must survive deduplication.
 
-A redelivery repeats event_id. A correction reuses payment_id with a NEW
-event_id. Dedup on payment_id and you silently destroy every correction.
+Two clocks:
+    event_ts    when it happened. Set here.
+    ingest_ts   when the pipeline saw it. Set by the consumer.
+A late invoice has an old event_ts and a current ingest_ts.
 
-THE TWO CLOCKS — do not collapse them either
---------------------------------------------
-    event_ts    when it happened in the business   (set here)
-    ingest_ts   when the pipeline saw it           (set by the consumer)
-
-A late invoice has an old event_ts but a current ingest_ts. That gap is why
-bronze partitions by INGEST date and silver by EVENT date.
-
-OUTPUT
-------
+Output:
     data/events.jsonl            one JSON object per line, in arrival order
-    data/_expected_totals.json   the answer key for reconciliation
+    data/_expected_totals.json   expected counts for reconciliation
 
 Usage:
     python src/producer.py --count 5000 --seed 42
+    python src/producer.py --count 5000 --seed 42 --sink kinesis
 """
 
 from __future__ import annotations
@@ -228,17 +221,12 @@ def write_local(events: list[dict], truth: dict, out_dir: Path) -> None:
 
 def write_kinesis(events: list[dict], cfg: dict) -> None:
     """
-    PartitionKey = payment_id.
+    PartitionKey is payment_id so a payment and its invoice land on the same
+    shard, since ordering is only guaranteed within a shard.
 
-    Kinesis hashes the partition key to pick a shard, and guarantees order
-    only WITHIN a shard. Keying on payment_id puts a payment and its invoice
-    on the same shard, so they arrive in the order they were produced.
-    Keying on event_id would scatter them and lose that guarantee.
-
-    PutRecords takes at most 500 records / 5 MB per call, and can partially
-    fail — FailedRecordCount > 0 with the rest succeeding. Those records must
-    be resent or they are simply lost; a 200 response does NOT mean every
-    record landed.
+    PutRecords accepts at most 500 records per call and can partially fail —
+    a 200 response with FailedRecordCount > 0. Only the failed subset is
+    resent; resending the whole chunk would duplicate what already succeeded.
     """
     import boto3
 
@@ -258,9 +246,7 @@ def write_kinesis(events: list[dict], cfg: dict) -> None:
             failed = response.get("FailedRecordCount", 0)
             if not failed:
                 break
-            # Resend ONLY the records that failed, preserving order within
-            # the retry. Resending the whole chunk would duplicate the ones
-            # that already succeeded.
+            # Only the failed records.
             chunk = [
                 rec for rec, result in zip(chunk, response["Records"])
                 if result.get("ErrorCode")

@@ -1,51 +1,17 @@
 """
-glue_silver_job.py — bronze -> silver as a real Glue (PySpark) job.
+bronze -> silver, as a Glue (PySpark) job.
 
-Same contract as src/silver_job.py, which is the pandas version:
-    parse -> validate -> quarantine -> dedup on event_id -> partition by event_dt
+Same contract as src/silver_job.py: parse, validate, quarantine bad rows,
+deduplicate on event_id, and repartition by event date. That version runs on
+pandas and is the one used for local development; this one is what runs at
+production volume.
 
-The logic is identical. What changes is that every step becomes a distributed
-operation, and three of them have costs that do not exist in pandas.
-
-
-THE THREE THINGS THAT ARE DIFFERENT IN SPARK
---------------------------------------------
-
-1. NARROW vs WIDE
-       read · from_json · validate · filter     NARROW — no data movement
-       dedup on event_id                        WIDE   — full shuffle
-       write partitionBy(event_dt)              WIDE   — repartition
-
-   The parallelism is free. The shuffles are what you tune.
-
-2. THE DEDUP KEY DETERMINES THE SKEW
-   event_id is a UUID, so it hashes uniformly and the dedup shuffle spreads
-   evenly. There is NO skew in this job, even though the dataset is 39% one
-   region — because this job never shuffles on region.
-
-   Skew comes from the key you shuffle on, not from the dataset.
-
-3. PARTITION OVERWRITE MODE
-       spark.sql.sources.partitionOverwriteMode = dynamic
-
-   Without this, mode("overwrite") deletes the ENTIRE table directory and
-   writes back only the partitions in this batch. Process one day and you
-   have just destroyed the other 364. This single setting is the difference
-   between an incremental load and an outage.
-
-
-WHEN THIS JOB IS WORTH IT
--------------------------
-At 9,446 records it is SLOWER than pandas — JVM startup and shuffle overhead
-exceed the actual work. It earns its keep at the stated production volume of
-2M payments/day (~3 GB/day), which does not fit one machine's memory.
-
-Justify Spark by volume, never by preference. Glue's Python-shell job type
-exists for small data and costs a fraction of a Spark job.
-
+At the current data size this job is slower than the pandas version — JVM
+startup and shuffle cost exceed the work. It is sized for the stated target of
+~2M payments/day.
 
 Job parameters:
-    --BUCKET   target bucket
+    --BUCKET
 """
 
 import sys
@@ -73,24 +39,16 @@ spark = glue_context.spark_session
 job = Job(glue_context)
 job.init(args["JOB_NAME"], args)
 
-# Adaptive Query Execution coalesces small post-shuffle partitions and splits
-# skewed ones at RUNTIME, from real statistics rather than the optimizer's
-# estimates. Default-on in Spark 3.2+, set explicitly so the intent is visible.
 spark.conf.set("spark.sql.adaptive.enabled", "true")
 spark.conf.set("spark.sql.adaptive.coalescePartitions.enabled", "true")
 spark.conf.set("spark.sql.adaptive.skewJoin.enabled", "true")
 
-# See docstring note 3. Without this, overwrite destroys the whole table.
+# Without dynamic mode, overwrite replaces the entire table directory rather
+# than only the partitions present in this batch.
 spark.conf.set("spark.sql.sources.partitionOverwriteMode", "dynamic")
 
-# ---------------------------------------------------------------------
-# Schemas declared, never inferred.
-#
-# inferSchema costs a FULL EXTRA PASS over the data, and worse, the type it
-# picks depends on which values it happened to see. A column that is long on
-# Monday becomes string on Tuesday because one record arrived with a null.
-# Declare the contract.
-# ---------------------------------------------------------------------
+# Schemas are declared, not inferred: inference costs an extra pass and the
+# type it picks depends on which values that pass happened to see.
 EVENT_SCHEMA = StructType([
     StructField("event_id", StringType()),
     StructField("event_type", StringType()),
@@ -117,23 +75,15 @@ BRONZE_SCHEMA = StructType([
 VALID_REGIONS = ["IN", "US", "EU", "SG", "AE"]
 VALID_CURRENCIES = ["INR", "USD", "EUR", "SGD", "AED"]
 
-# ---------------------------------------------------------------------
-# READ — narrow. One task per file, no shuffle.
-# ---------------------------------------------------------------------
 bronze = spark.read.schema(BRONZE_SCHEMA).json(f"s3://{BUCKET}/bronze/")
 print(f"bronze records read : {bronze.count():,}")
 
-# ---------------------------------------------------------------------
-# PARSE — from_json returns NULL for an unparseable string rather than
-# throwing. That is what lets a bad record be quarantined instead of
-# killing the job.
-# ---------------------------------------------------------------------
+# from_json yields NULL on unparseable input rather than raising, which is what
+# allows a bad record to be quarantined instead of failing the job.
 parsed = bronze.withColumn("e", F.from_json(F.col("raw"), EVENT_SCHEMA))
 
-# ---------------------------------------------------------------------
-# VALIDATE — one when/otherwise chain producing a reject_reason.
-# The FIRST matching condition wins, so checks run most-fundamental first.
-# ---------------------------------------------------------------------
+# First matching condition wins, so the cheapest and most fundamental checks
+# come first.
 reject_reason = (
     F.when(F.col("e").isNull(), F.lit("unparseable_json"))
      .when(F.col("e.event_id").isNull(), F.lit("missing_field:event_id"))
@@ -153,52 +103,38 @@ reject_reason = (
      .otherwise(F.lit(None))
 )
 
-# cache() because `flagged` is consumed twice (good and bad branches).
-# Without it the entire read + parse + validate chain runs twice — Spark is
-# lazy, so a DataFrame used N times is COMPUTED N times unless persisted.
+# Cached because the good and bad branches each consume it; without this the
+# read, parse and validation chain is evaluated twice.
 flagged = parsed.withColumn("reject_reason", reject_reason).cache()
 
-# NOTE: a string "abc" in a DoubleType field becomes NULL during from_json,
-# so it surfaces as null_field:amount rather than amount_not_numeric. The
-# pandas version distinguishes them because Python keeps the original type.
-# Same records quarantined, different label.
+# Note: a non-numeric string in a DoubleType field becomes NULL during
+# from_json, so it is labelled null_field:amount here where the pandas version
+# reports amount_not_numeric. Same records rejected, different reason string.
 
 good = flagged.filter(F.col("reject_reason").isNull())
 bad = flagged.filter(F.col("reject_reason").isNotNull())
 
-# ---------------------------------------------------------------------
-# DEDUP — the only genuinely expensive step. WIDE: a full shuffle on
-# event_id so every copy of an id lands on the same executor.
-#
-# row_number() over a window, keep 1 — the canonical Spark dedup.
-# dropDuplicates() exists but gives no control over WHICH row survives;
-# here the first arrival must win, so the ordering is explicit.
-# ---------------------------------------------------------------------
+# row_number rather than dropDuplicates: the first arrival has to win, and
+# dropDuplicates gives no control over which row survives.
 dedup_window = Window.partitionBy("e.event_id").orderBy(F.col("ingest_ts").asc())
-
 deduped = (
     good.withColumn("rn", F.row_number().over(dedup_window))
         .filter(F.col("rn") == 1)
         .drop("rn")
 )
 
-# Quarantine gets the same treatment. A redelivered bad record is still a
-# duplicate, and double-counting it corrupts the rejected total.
-# Regression guard for notes/failures.md #3.
+# Quarantine needs the same guarantee; a redelivered bad record would otherwise
+# inflate the rejected count and break the daily reconciliation.
 quarantine_key = F.coalesce(F.col("e.event_id"), F.col("raw"))
 quarantine_window = Window.partitionBy(quarantine_key).orderBy(F.col("ingest_ts").asc())
-
 bad_deduped = (
     bad.withColumn("rn", F.row_number().over(quarantine_window))
        .filter(F.col("rn") == 1)
        .drop("rn")
 )
 
-# ---------------------------------------------------------------------
-# PROJECT — flatten, and derive event_dt as the WRITE partition.
-# Bronze was partitioned by ingest date; silver is partitioned by when the
-# event actually happened.
-# ---------------------------------------------------------------------
+# Bronze is partitioned by arrival; silver is partitioned by when the event
+# actually happened.
 silver = (
     deduped.select(
         F.col("e.event_id").alias("event_id"),
@@ -220,17 +156,8 @@ silver = (
 payments = silver.filter(F.col("event_type") == "PAYMENT_RECEIVED")
 invoices = silver.filter(F.col("event_type") == "INVOICE_CLEARED")
 
-# ---------------------------------------------------------------------
-# WRITE.
-#
-# repartition("event_dt") BEFORE partitionBy avoids the small-files problem.
-# Without it every task writes a file into every partition — 200 tasks x 13
-# dates = 2,600 tiny files. Shuffling by the partition column first gives one
-# writer per date.
-#
-# Small files are the most common self-inflicted lakehouse problem: per-file
-# open cost dominates once files fall well below ~128 MB.
-# ---------------------------------------------------------------------
+# repartition by the partition column first, otherwise every task writes a file
+# into every partition and the output is thousands of small files.
 for name, frame in (("payments", payments), ("invoices", invoices)):
     (frame.repartition("event_dt")
           .write.mode("overwrite")
@@ -242,7 +169,7 @@ for name, frame in (("payments", payments), ("invoices", invoices)):
         F.col("e.event_id").alias("event_id"),
         "batch_id", "ingest_ts", "reject_reason", "raw",
     )
-    .coalesce(1)                      # quarantine is tiny; one file is right
+    .coalesce(1)
     .write.mode("overwrite")
     .parquet(f"s3://{BUCKET}/silver/quarantine/"))
 

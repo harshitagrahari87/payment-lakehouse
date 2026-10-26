@@ -1,45 +1,26 @@
 """
-silver_job.py — bronze -> silver.
+bronze -> silver.
 
-This is the Glue job's logic, written in pandas so it runs without a cluster.
-Every operation here has a one-to-one Spark equivalent, noted inline.
+Parses the raw messages, validates them, routes failures to a quarantine
+table, deduplicates on event_id and repartitions by event date.
 
+Validation lives here rather than in bronze so that a malformed record is
+contained to one row instead of breaking ingestion. Nothing is dropped:
+rejected records keep their original payload and a reason, so they can be
+reprocessed once the cause is fixed.
 
-WHAT SILVER IS
---------------
-    bronze   raw strings, append-only, partitioned by INGEST date
-    silver   parsed, typed, validated, DEDUPED, partitioned by EVENT date
-    gold     business state and aggregates
+Spark equivalents for the two non-obvious steps:
 
-Silver is where a bad record is allowed to fail, because failure here is
-contained to one row. In bronze it would break ingestion itself.
+    dedup
+        w = Window.partitionBy("event_id").orderBy("ingest_ts")
+        df.withColumn("rn", row_number().over(w)).filter("rn = 1").drop("rn")
 
-
-THE THREE OPERATIONS
---------------------
-1. PARSE + VALIDATE   bad rows go to quarantine, never dropped.
-                      In finance you do not silently discard a transaction.
-
-2. DEDUP on event_id  keep the FIRST arrival by ingest_ts.
-                      Dedup is on event_id, NOT payment_id. A redelivery
-                      repeats event_id; a correction reuses payment_id with
-                      a new event_id and must survive.
-
-   Spark:
-       w = Window.partitionBy("event_id").orderBy("ingest_ts")
-       df.withColumn("rn", row_number().over(w)).filter("rn = 1").drop("rn")
-
-3. PARTITION by event_dt, not ingest_dt.
-   Bronze is read forward-only by arrival; silver is written by when the
-   event actually happened. That is what lets a 6-day-late invoice land in
-   its true partition without reprocessing all of bronze.
-
-   Spark:
-       df.write.partitionBy("event_dt").mode("append").format("delta").save(...)
-
+    write
+        df.write.partitionBy("event_dt").mode("overwrite").parquet(path)
 
 Usage:
     python src/silver_job.py
+    python src/silver_job.py --source s3 --sink s3
 """
 
 from __future__ import annotations
@@ -253,13 +234,12 @@ def write_partitioned(df: pd.DataFrame, out_root: Path, name: str) -> int:
 
 def write_partitioned_s3(df: pd.DataFrame, cfg: dict, name: str) -> int:
     """
-    Same layout on S3, with the prefix cleared first.
+    Writes the partitioned layout to S3, clearing the prefix first.
 
-    Clearing matters because this job and the Spark/Glue version write
-    different filenames (part-000.parquet vs part-00000-<uuid>-c000.snappy
-    .parquet). A Hive-style table is "whatever files are in the directory",
-    so without this both sets survive and every downstream count doubles —
-    while both jobs still report success. See notes/failures.md #6.
+    This job and the Spark version write different filenames
+    (part-000.parquet vs part-00000-<uuid>-c000.snappy.parquet). A Hive-style
+    table is defined by whatever files sit under the prefix, so without
+    clearing, both sets survive and every downstream count is inflated.
     """
     import boto3
 

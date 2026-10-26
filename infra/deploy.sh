@@ -41,7 +41,7 @@ if aws kinesis describe-stream-summary --stream-name "$STREAM" --region "$REGION
 else
     aws kinesis create-stream --stream-name "$STREAM" --shard-count 1 --region "$REGION"
     aws kinesis wait stream-exists --stream-name "$STREAM" --region "$REGION"
-    echo "      created (BILLING ~\$0.36/day — run teardown.sh when done)"
+    echo "      created (~\$0.36/day while it exists)"
 fi
 STREAM_ARN=$(aws kinesis describe-stream-summary --stream-name "$STREAM" --region "$REGION" \
              --query 'StreamDescriptionSummary.StreamARN' --output text)

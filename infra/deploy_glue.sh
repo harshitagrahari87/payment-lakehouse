@@ -62,10 +62,8 @@ fi
 aws iam attach-role-policy --role-name "$ROLE" \
     --policy-arn arn:aws:iam::aws:policy/service-role/AWSGlueServiceRole
 
-# S3 access. TWO ARNs, and this is the trap that bites everyone:
-#   s3:ListBucket  is a BUCKET-level action  -> arn:aws:s3:::bucket
-#   s3:GetObject   is an OBJECT-level action -> arn:aws:s3:::bucket/*
-# A role that lists AND reads needs both. There is no s3:ListObject.
+# S3 access needs two statements: ListBucket is a bucket-level action and
+# GetObject/PutObject are object-level, so they take different ARNs.
 aws iam put-role-policy --role-name "$ROLE" --policy-name s3-lakehouse \
     --policy-document "{
         \"Version\": \"2012-10-17\",

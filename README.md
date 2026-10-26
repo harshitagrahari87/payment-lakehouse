@@ -143,7 +143,7 @@ still have looked plausible. The reconciliation is what proves they arrived.
 
 The US writes off payments at nearly **twice** India's rate — not because US
 payments are worse, but because its matching window is 3 days instead of 7.
-**That is an actionable finding, and it is why the pipeline exists.**
+Extending it toward the 5-7 day norm would recover much of the difference.
 
 ---
 
@@ -162,7 +162,7 @@ payments are worse, but because its matching window is 3 days instead of 7.
 | `as_of` | DAG `data_interval_end` | `now()` | PENDING vs EXPIRED depends on the date asked; `now()` makes backfills rewrite history | — |
 | Compute | pandas | PySpark | 9,446 records — Spark's JVM and shuffle overhead exceed the work | volume reaches ~3 GB/day, then Glue Spark |
 | Serving | Athena on S3 | Redshift | spiky analyst queries, pay-per-query, no idle cluster | sustained BI concurrency needing WLM |
-| Table format | Parquet | Iceberg / Delta | no concurrent writers or row-level updates when the choice was made | **already hit this** — two writers in one prefix silently doubled every count (`failures.md` #6). Iceberg's transaction log defines which files are the table; a Hive prefix does not. This is the next change. |
+| Table format | Parquet | Iceberg / Delta | no concurrent writers or row-level updates when the choice was made | **this has already bitten** — two writers in one prefix inflated every count, since a Hive-style table is defined by directory listing rather than a manifest. Migrating gold to Iceberg is the next change. |
 
 ---
 
@@ -226,9 +226,6 @@ python3 src/athena.py bench
 ./infra/teardown.sh --all    # also empties and deletes the bucket
 ```
 
-A Kinesis shard bills ~$0.36/day whether or not data flows through it.
-`teardown.sh` was written **before** the resources it deletes.
-
-```
-Charges to date   $0.00      Credits  $120      Hard cap  $20/month
-```
+A Kinesis shard bills around $0.36/day whether or not data flows through it,
+so the stream is created per session and removed at the end of it. S3 and
+Athena at this volume are negligible.

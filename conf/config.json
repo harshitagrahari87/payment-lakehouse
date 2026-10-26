@@ -1,11 +1,11 @@
 {
   "project": "payment-lakehouse",
-  "_comment_region": "Account 569854554172 is SCP-restricted to ap-southeast-2. ap-south-1 and us-east-1 are explicitly denied — do not change this without retesting.",
+  "_comment_region": "this account is restricted to ap-southeast-2",
   "region": "ap-southeast-2",
   "bucket": "payment-lakehouse-harshit-apse2",
   "stream_name": "payment-events",
 
-  "_comment_regions": "weight drives deliberate skew: IN is 40% of volume. retry_window_days is the per-region matching window and is the reason this lives in config, not code.",
+  "_comment_regions": "weight controls the regional volume distribution; retry_window_days is the per-region matching window and lives here so it can change without a deploy",
   "regions": [
     { "code": "IN", "weight": 0.40, "currency": "INR", "retry_window_days": 7 },
     { "code": "US", "weight": 0.20, "currency": "USD", "retry_window_days": 3 },
@@ -14,7 +14,7 @@
     { "code": "AE", "weight": 0.10, "currency": "AED", "retry_window_days": 10 }
   ],
 
-  "_comment_defects": "every rate here exists to exercise one downstream control. do not set them to zero.",
+  "_comment_defects": "each rate exercises one downstream control",
   "defects": {
     "duplicate_rate": 0.02,
     "malformed_rate": 0.01,

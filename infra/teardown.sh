@@ -2,15 +2,12 @@
 #
 # teardown.sh — delete every billable resource in this project.
 #
-# Written BEFORE the resources it deletes. A Kinesis shard bills ~$0.36/day
-# whether or not data flows through it, and a forgotten stream is the only
-# thing in this project that costs real money.
+# A Kinesis shard bills ~$0.36/day whether or not data flows through it, so
+# this runs at the end of every session.
 #
-# Run at the end of every session:
 #     ./infra/teardown.sh
 #
-# S3 objects are kept by default — they cost fractions of a cent and are the
-# artifact. Use --all to remove those too.
+# S3 objects are kept by default. Pass --all to remove the bucket too.
 #
 set -uo pipefail
 
@@ -28,8 +25,8 @@ echo "bucket : $BUCKET"
 echo
 
 # --- event source mapping ------------------------------------------------
-# Delete the mapping first. Removing the stream while a mapping still points
-# at it leaves the mapping in a permanent error state.
+# Mapping first: removing the stream while a mapping still points at it
+# leaves the mapping in an error state.
 echo "[1/5] event source mappings"
 MAPPINGS=$(aws lambda list-event-source-mappings \
              --function-name "$FUNCTION" --region "$REGION" \
@@ -45,7 +42,7 @@ echo "[2/5] lambda function"
 aws lambda delete-function --function-name "$FUNCTION" --region "$REGION" >/dev/null 2>&1 \
     && echo "      deleted $FUNCTION" || echo "      none"
 
-# --- kinesis (the one that actually bills) -------------------------------
+# --- kinesis -------------------------------------------------------------
 echo "[3/5] kinesis stream"
 aws kinesis delete-stream --stream-name "$STREAM" \
     --enforce-consumer-deletion --region "$REGION" >/dev/null 2>&1 \
@@ -80,4 +77,4 @@ echo
 echo "remaining billable compute:"
 aws kinesis list-streams --region "$REGION" --query 'StreamNames' --output text
 aws lambda list-functions --region "$REGION" --query 'Functions[].FunctionName' --output text
-echo "(empty above = nothing is billing)"
+echo "(empty above means nothing is running)"

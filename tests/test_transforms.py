@@ -1,9 +1,9 @@
 """
-Tests for the transformation logic.
+Tests for the transformation rules.
 
-These test the RULES, not the plumbing. Every one of them corresponds to a
-decision that would be wrong in a way no exception would reveal — the class
-of bug that makes a pipeline report SUCCESS while producing wrong numbers.
+These cover the decisions that would be wrong without raising anything —
+validation boundaries, which row survives deduplication, and the retry-window
+edges that decide whether a payment is still pending or written off.
 
     pytest -q
 """
@@ -115,8 +115,8 @@ def test_dedup_does_not_collapse_corrections():
 
 def test_quarantine_is_deduped_too():
     """
-    Regression test for failures.md #3 — a re-ingestion doubled the rejected
-    count while the job still reported SUCCESS.
+    A re-ingestion must not inflate the rejected count, which would break the
+    daily reconciliation.
     """
     df = pd.DataFrame([
         {"event_id": "bad1", "ingest_ts": "t1", "raw": "{}", "reject_reason": "x"},

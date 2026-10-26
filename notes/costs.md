@@ -76,18 +76,19 @@ One analyst running 20 investigation queries a day is the difference between
 
 ---
 
-## 4. Current AWS spend
+## 4. Run cost
 
 ```
-Charges to date        $0.00
-Credits remaining      $120.00 (expires Apr 25, 2027)
-Hard monthly cap       $20 spend limit + early cost controls
-Running compute        none — no Kinesis stream, no Glue job, no cluster
+S3        5.4 MB total                         negligible
+Athena    every query hits the 10 MB minimum   $0.000048 each
+Glue      2 x G.1X, 89s and 71s                ~$0.02 per run
+Kinesis   1 shard, deleted after each session  ~$0.36/day while it exists
+Lambda    95 invocations x ~45 ms @ 256 MB     within free tier
 ```
 
-S3 at 5.4 MB total and Athena at the 10 MB minimum are rounding errors.
-**The only thing that would bill meaningfully is a forgotten Kinesis shard
-(~$0.36/day)** — hence `infra/teardown.sh` before the stream is created.
+The only component with meaningful idle cost is the Kinesis shard, which bills
+whether or not data flows through it. `infra/teardown.sh` removes it along with
+the Lambda, the event source mapping and the IAM role.
 
 ---
 
@@ -149,5 +150,3 @@ immediately afterwards. Verified: `list-streams` returned empty.
 The US writes off payments at roughly **twice** the rate of India, and the
 driver is not payment quality — it is the 3-day matching window. Extending it
 toward the 5-7 day norm would recover a large share of those write-offs.
-
-This is the output the whole pipeline exists to produce.

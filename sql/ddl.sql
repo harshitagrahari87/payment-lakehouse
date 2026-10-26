@@ -1,25 +1,16 @@
--- Athena DDL for the payment lakehouse.
+-- Athena external table definitions.
 --
--- Explicit DDL, not a Glue Crawler. The difference matters and gets asked:
+-- Declared rather than crawled. A crawler infers types from whatever files it
+-- happens to see, which means a column can change type between runs; explicit
+-- DDL keeps the schema in version control and fails loudly when the data stops
+-- matching it. Crawlers are the better fit for data you do not control.
 --
---   Crawler       scans the data, INFERS types, creates/updates the table.
---                 Costs DPU-minutes, runs on a schedule, and can silently
---                 change a column type when it meets a new file.
---   Explicit DDL  you declare the contract. Free, deterministic, reviewable
---                 in git. If the data stops matching, the query fails loudly
---                 instead of the schema quietly moving.
---
--- For a pipeline you own end to end, declare the schema. Use a crawler for
--- data you do not control.
---
--- __BUCKET__ is substituted by infra/athena.sh.
+-- __BUCKET__ is substituted by src/athena.py.
 
 CREATE DATABASE IF NOT EXISTS payment_lakehouse;
 
--- ---------------------------------------------------------------------
--- BRONZE — raw JSON, partitioned by ingest date/hour.
--- `raw` stays a string: bronze does not interpret anything.
--- ---------------------------------------------------------------------
+-- Bronze: raw JSON. `raw` stays a string because bronze does not interpret
+-- anything.
 CREATE EXTERNAL TABLE IF NOT EXISTS payment_lakehouse.bronze_events (
     batch_id       string,
     ingest_ts      string,
@@ -31,9 +22,6 @@ PARTITIONED BY (ingest_dt string, hour string)
 ROW FORMAT SERDE 'org.openx.data.jsonserde.JsonSerDe'
 LOCATION 's3://__BUCKET__/bronze/';
 
--- ---------------------------------------------------------------------
--- GOLD — the business tables
--- ---------------------------------------------------------------------
 CREATE EXTERNAL TABLE IF NOT EXISTS payment_lakehouse.fct_payment_state (
     payment_id         string,
     customer_id        string,
@@ -77,6 +65,6 @@ CREATE EXTERNAL TABLE IF NOT EXISTS payment_lakehouse.reconciliation_daily (
 STORED AS PARQUET
 LOCATION 's3://__BUCKET__/gold/reconciliation_daily/';
 
--- Bronze is PARTITIONED, so Athena does not know its partitions exist until
--- told. Without this, the table returns zero rows and looks broken.
+-- Partitions are not discovered automatically. Without this the table parses
+-- but returns nothing.
 MSCK REPAIR TABLE payment_lakehouse.bronze_events;

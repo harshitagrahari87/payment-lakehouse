@@ -1,54 +1,17 @@
 """
-payment_lakehouse_dag.py — orchestrates bronze -> silver -> gold.
+Orchestrates bronze -> silver -> gold with a reconciliation gate.
 
-This is the DAG the interview question was really about: not "can you list
-operators" but "does your pipeline survive a backfill, a late file, and a
-silently-wrong result".
-
-
-THE FOUR THINGS THIS DAG EXISTS TO DEMONSTRATE
-----------------------------------------------
-
-1. IDEMPOTENCY VIA logical_date
-   gold_job takes --as-of. The DAG passes {{ data_interval_end }}, never
-   now(). Re-running 20 Oct six months later recomputes 20 Oct's numbers,
-   not today's. Without this a backfill rewrites history, because whether a
-   payment is PENDING or EXPIRED depends on the date you ask.
-
-2. A SENSOR IN reschedule MODE
-   poke mode holds a worker slot for the whole wait. With a pool of 16 and
-   16 sensors waiting on upstream files, the pool deadlocks and nothing can
-   run. reschedule frees the slot between checks.
-
-3. A QUALITY GATE THAT FAILS THE DAG
-   reconciliation_check compares gold's totals to the control identity:
-       received = matched + mismatch + pending + expired + rejected
-   If that does not balance the DAG goes red. A pipeline that completes with
-   wrong numbers is worse than one that fails, because nobody investigates
-   a green run.
-
-4. CLEANUP THAT RUNS ANYWAY
-   trigger_rule=ALL_DONE, so temp files are removed whether the run passed
-   or failed. The default ALL_SUCCESS would skip cleanup exactly when it is
-   most needed.
-
-
-PRODUCTION VARIANT
-------------------
-Here the transforms run as PythonOperator because the jobs are pandas. On
-Glue they become:
-
-    from airflow.providers.amazon.aws.operators.glue import GlueJobOperator
+The transforms run as PythonOperator here because the jobs are pandas. The
+Glue variant swaps them for GlueJobOperator; dependencies and the gate are
+unchanged:
 
     silver = GlueJobOperator(
         task_id="bronze_to_silver",
         job_name="payment-bronze-to-silver",
-        script_args={"--as_of": "{{ data_interval_end }}"},
+        script_args={"--AS_OF": "{{ data_interval_end }}"},
         aws_conn_id="aws_default",
         wait_for_completion=True,
     )
-
-Same shape, same dependencies, same gate. Only the executor changes.
 """
 
 from __future__ import annotations
@@ -79,7 +42,6 @@ def _config() -> dict:
 
 
 def alert_on_failure(context) -> None:
-    """In production this pages Slack/PagerDuty. The log_url is the useful bit."""
     ti = context["task_instance"]
     print(
         f"FAILED {context['dag'].dag_id}.{ti.task_id} "
@@ -88,7 +50,7 @@ def alert_on_failure(context) -> None:
 
 
 def sla_miss_alert(dag, task_list, blocking_task_list, slas, blocking_tis) -> None:
-    """SLA is measured from the DAG RUN start, not from when the task started."""
+    # SLA is measured from the DAG run start, not from when the task started.
     print(f"SLA MISS {dag.dag_id}: {task_list}")
 
 
@@ -110,8 +72,8 @@ default_args = {
     default_args=default_args,
     start_date=pendulum.datetime(2026, 10, 20, tz="UTC"),
     schedule="0 2 * * *",
-    catchup=False,              # ALWAYS explicit. The default is True and it bites.
-    max_active_runs=1,          # a second run would race the same partitions
+    catchup=False,              # set explicitly; the default is True
+    max_active_runs=1,          # concurrent runs would race the same partitions
     dagrun_timeout=timedelta(hours=2),
     sla_miss_callback=sla_miss_alert,
     params={
@@ -123,10 +85,6 @@ default_args = {
 )
 def payment_lakehouse():
 
-    # ------------------------------------------------------------------
-    # Wait for bronze. mode="reschedule" releases the worker slot between
-    # checks — poke mode would hold it for the entire wait.
-    # ------------------------------------------------------------------
     def _bronze_has_data(**context) -> bool:
         import boto3
 
@@ -138,6 +96,8 @@ def payment_lakehouse():
         print(f"bronze objects present: {found}")
         return found
 
+    # reschedule, not poke: poke holds a worker slot for the whole wait, and
+    # enough waiting sensors will deadlock the pool.
     wait_for_bronze = PythonSensor(
         task_id="wait_for_bronze",
         python_callable=_bronze_has_data,
@@ -148,7 +108,6 @@ def payment_lakehouse():
     )
 
     def _run(script: str, *args) -> None:
-        """Run a job script and surface its output in the task log."""
         cmd = [sys.executable, str(PROJECT / "src" / script), *args]
         print("running:", " ".join(cmd))
         result = subprocess.run(cmd, capture_output=True, text=True)
@@ -165,18 +124,19 @@ def payment_lakehouse():
     @task(task_id="silver_to_gold")
     def silver_to_gold(**context):
         params = context["params"]
-        # THE IDEMPOTENCY LINE. data_interval_end, never now().
+        # data_interval_end, not now(): PENDING vs EXPIRED depends on the date
+        # asked, so using wall-clock time would make backfills rewrite history.
         as_of = context["data_interval_end"].isoformat()
         _run("gold_job.py", "--source", params["source"], "--sink", params["sink"],
              "--as-of", as_of)
 
-    # ------------------------------------------------------------------
-    # The gate. Reads gold back and checks the control identity.
-    # A pipeline that completes with wrong numbers is worse than one that
-    # fails — nobody investigates a green run.
-    # ------------------------------------------------------------------
     @task(task_id="reconciliation_check")
     def reconciliation_check(**context):
+        """
+        Reads gold back and fails the run if the totals do not hold. A pipeline
+        that completes with wrong numbers is worse than one that fails, because
+        a green run does not get investigated.
+        """
         import io
 
         import boto3
@@ -191,7 +151,6 @@ def payment_lakehouse():
 
         counts = fct["state"].value_counts().to_dict()
         accounted = sum(counts.get(s, 0) for s in STATES)
-
         print({s: counts.get(s, 0) for s in STATES})
 
         if accounted != len(fct):
@@ -203,8 +162,8 @@ def payment_lakehouse():
         if unknown:
             raise AirflowFailException(f"unexpected states in gold: {unknown}")
 
-        # A run where nothing matched is almost certainly a broken join
-        # rather than a real business outcome.
+        # A collapsed match rate usually means a broken join or an upstream
+        # ID format change, neither of which raises on its own.
         match_rate = (counts.get("MATCHED", 0) + counts.get("AMOUNT_MISMATCH", 0)) / len(fct)
         print(f"match rate: {match_rate:.1%}")
         if match_rate < 0.50:
@@ -226,8 +185,7 @@ def payment_lakehouse():
         )
         print(f"published: {summary}")
 
-    # Runs whether or not the pipeline succeeded. ALL_SUCCESS (the default)
-    # would skip cleanup exactly when it is most needed.
+    # ALL_DONE so cleanup runs after a failure too, which is when it matters.
     cleanup = BashOperator(
         task_id="cleanup",
         bash_command="rm -rf /tmp/payment-lakehouse/{{ ds }} || true",

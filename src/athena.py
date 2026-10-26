@@ -1,17 +1,8 @@
 """
-athena.py — register the lakehouse in the Glue Catalog and measure query cost.
+Registers the lakehouse tables in the Glue Catalog and measures query cost.
 
-Athena bills on BYTES SCANNED. Not rows returned, not query time. So every
-cost decision in a lakehouse is really a decision about how few bytes a query
-has to read:
-
-    columnar format      read 2 columns instead of 40
-    partitioning         read 1 day instead of 3 years
-    compaction           fewer per-file round trips
-    SELECT specific cols SELECT * defeats columnar entirely
-
-`bench` runs the same logical question against different layouts and prints
-the bytes each one scanned. That number is the point of the exercise.
+Athena bills on bytes scanned, so `bench` runs the same question against
+different layouts and reports what each one read.
 
 Usage:
     python3 src/athena.py ddl
@@ -147,22 +138,19 @@ def cmd_bench(athena: Athena) -> None:
     gold_two_col = dict(results)["2 columns — GOLD (column pruning)"]
     gold_star = dict(results)["SELECT * — GOLD (pruning defeated)"]
 
-    print("\n--- what the numbers say ---")
+    print("\n--- notes ---")
     if gold_count == 0:
-        print(f"  count(*) JSON scanned {human(bronze_count)}, Parquet scanned 0 B.")
-        print("  Parquet stores row counts in the FILE FOOTER, so Athena answers")
-        print("  count(*) from metadata without opening a data page. JSON has no")
-        print("  footer and no statistics — it must parse every byte.")
+        print(f"  count(*): JSON scanned {human(bronze_count)}, Parquet scanned 0 B.")
+        print("  Parquet keeps row counts in the file footer, so Athena answers")
+        print("  from metadata. JSON has no footer and must parse every byte.")
     else:
         print(f"  JSON vs Parquet, same question : {bronze_count / gold_count:>6.1f}x fewer bytes")
 
     if gold_two_col:
         print(f"\n  2 columns vs SELECT *          : {gold_star / gold_two_col:>6.1f}x fewer bytes")
-        print("  SELECT * defeats columnar storage entirely.")
 
-    print("\n  Athena bills a 10 MB MINIMUM per query, so at this volume every")
-    print("  query costs the same. The RATIO is what scales — at 3 years of")
-    print("  production data it is cents vs dollars per analyst query.")
+    print("\n  Athena bills a 10 MB minimum per query, so at this volume every")
+    print("  query costs the same. The ratios are what scale with data size.")
 
 
 def main() -> None:
