@@ -275,6 +275,127 @@ The pipeline was correct; the expectations described a different dataset.
 
 **Fix:** regenerate the whole chain together.
 
-**Takeaway:** a fixture and the expectations derived from it are one artifact
-and must be regenerated as a unit. Only the time-invariant states matched —
-which is precisely why PENDING and EXPIRED were the two that drifted.
+---
+
+## 8. Auto Loader typed a column as STRING and the cast killed the stream
+
+**Severity:** pipeline outage
+
+Building the Databricks implementation, the silver stream failed on the first
+run:
+
+```
+CAST_INVALID_INPUT: the value '2461.65' of type STRING cannot be cast to BIGINT
+```
+
+**Cause:** the generator deliberately injects `"amount": "not-a-number"` for
+about 1% of records. Auto Loader, inferring the schema, therefore typed `amount`
+as STRING to accommodate every value it saw. The validation expression
+`amount <= 0` then compared a STRING against an integer literal, which Spark
+resolves by casting to BIGINT — and `'2461.65'` is not a valid BIGINT.
+
+So a malformed record did not merely fail validation. It changed the inferred
+type of the column, and the validation written to catch it became the thing that
+crashed.
+
+**Fix**
+
+```python
+.withColumn("amount", F.expr("try_cast(amount_raw AS DOUBLE)"))
+```
+
+`try_cast` returns NULL instead of raising, so the bad value flows into the
+quarantine path as `amount_not_numeric` rather than taking the stream down.
+
+**Takeaways**
+
+1. Schema inference is driven by the data, including the bad data. A single
+   malformed value can retype a column and change the behaviour of every
+   expression downstream.
+2. In an ingestion path, prefer the non-throwing variant of any cast or parse.
+   `try_cast` and `from_json` returning NULL are what make a quarantine pattern
+   possible at all.
+
+---
+
+## 9. datediff counts calendar boundaries, not elapsed time
+
+**Severity:** silent misclassification — 10 payments written off incorrectly
+
+Gold reconciled exactly on MATCHED, AMOUNT_MISMATCH and REJECTED, but was off by
+ten on the two time-dependent states:
+
+```
+PENDING   expected 487   actual 477
+EXPIRED   expected 192   actual 202
+```
+
+**Cause:** the generator measures the wait as a timedelta — complete 24-hour
+periods. Gold used `datediff(as_of, payment_ts)`, which counts **calendar day
+boundaries crossed**.
+
+A payment at 23:00 on Oct 28, evaluated at 18:37 on Nov 4, is six elapsed days
+but seven calendar days. Ten payments sat exactly on that boundary and were
+pushed past their retry window.
+
+**Fix**
+
+```python
+F.floor((F.unix_timestamp(F.to_timestamp(F.lit(AS_OF)))
+       - F.unix_timestamp("payment_ts")) / 86400)
+```
+
+**Takeaways**
+
+1. `datediff` answers "how many midnights between these two timestamps", not
+   "how much time has elapsed". For a duration-based rule the difference is
+   material and it lands exactly on the boundary cases.
+2. Nothing raised. The job succeeded and wrote off ten real payments. Only the
+   reconciliation against known totals exposed it — and it exposed it precisely
+   because MATCHED and REJECTED are time-invariant while PENDING and EXPIRED
+   are not, which immediately pointed at the time arithmetic.
+
+---
+
+## 10. NOT(NULL) is NULL, so the quarantine table lost nine records
+
+**Severity:** silent data loss, in the table built to prevent silent data loss
+
+The declarative pipeline produced 54 quarantined records against an expected 63.
+Nine missing — exactly the number of records where the generator removes the
+`region` field entirely.
+
+**Cause:** the quarantine dataset selected rejects with
+
+```sql
+NOT (... AND region IN ('IN','US','EU','SG','AE') ...)
+```
+
+When `region` is NULL, `region IN (...)` evaluates to **NULL**, not FALSE. The
+whole conjunction becomes NULL, `NOT (NULL)` is NULL, and a filter keeps only
+rows where the predicate is TRUE.
+
+So those nine records were dropped by the validity expectation on the clean
+table **and** excluded from the quarantine table. They passed through the
+pipeline and ceased to exist.
+
+**Fix**
+
+```python
+.filter(f"({VALID}) IS NOT TRUE")
+```
+
+`IS NOT TRUE` collapses both FALSE and NULL to true, which is the correct
+semantics for "this row did not pass validation".
+
+**Takeaways**
+
+1. SQL is three-valued. `NOT (unknown)` is still unknown, and a WHERE clause
+   discards unknown. Any validity check written as `NOT (...)` over nullable
+   columns has this hole.
+2. The inverted-condition quarantine pattern only works if the inversion is
+   null-safe. Otherwise the records most likely to be malformed — the ones with
+   missing fields — are exactly the ones it fails to capture.
+3. Again, no error. The count was the only signal.
+
+---

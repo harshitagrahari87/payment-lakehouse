@@ -1,14 +1,22 @@
 # Payment Reconciliation Lakehouse
 
-An end-to-end AWS data platform that ingests payment and invoice events through
-Kinesis, matches them under a region-configurable retry window, and produces a
-daily reconciliation report that **must balance to the payment**.
+One business problem, built twice: once on **AWS** (Kinesis, Lambda, Glue, S3,
+Athena) and once on **Databricks** (Auto Loader, Delta, Unity Catalog, Lakeflow
+Declarative Pipelines).
 
-Every number below was measured on a live run in `ap-southeast-2`, not estimated.
+Both implementations ingest payment and invoice events, match them under a
+region-configurable retry window, and produce a daily reconciliation report that
+**must balance to the payment**. Both reconcile to the same figures, which is how
+the second one was verified against the first.
+
+Every number below was measured on live runs, not estimated.
 
 ```
-Kinesis -> Lambda -> S3 bronze -> silver -> gold -> Athena
-9,446 events                               ALL RECONCILED
+AWS          Kinesis -> Lambda -> S3 bronze -> silver -> gold -> Athena
+Databricks   Auto Loader -> Delta bronze -> silver -> gold -> Lakeflow pipeline
+
+9,446 events        MATCHED 4,115 · MISMATCH 143 · PENDING 487
+                    EXPIRED 192 · REJECTED 63        — identical on both
 ```
 
 ---
@@ -32,6 +40,8 @@ Every design decision below traces back to a constraint in that paragraph.
 
 ## 2. Architecture
 
+### AWS
+
 ```mermaid
 flowchart TD
     P["producer.py<br/>synthetic events<br/>+ deliberate defects"]
@@ -44,16 +54,32 @@ flowchart TD
     G["Glue / gold_job<br/>match payments to invoices<br/>retry window · state machine"]
     GD["S3 GOLD<br/>fct_payment_state<br/>dim_region<br/>reconciliation_daily"]
     A["Athena<br/>Glue Data Catalog"]
-    CW["CloudWatch<br/>metrics + alarms"]
     AF["Airflow DAG<br/>sensor → silver → gold →<br/>reconciliation gate → metrics"]
 
     P -->|put_records| K --> L --> B --> S
     S --> SV
     S --> Q
     SV --> G --> GD --> A
-    G --> CW
     AF -.orchestrates.-> S
     AF -.orchestrates.-> G
+```
+
+### Databricks
+
+```mermaid
+flowchart TD
+    V["UC Volume<br/>landing/events"]
+    AL["Auto Loader<br/>cloudFiles · rescue mode<br/>availableNow trigger"]
+    BB["bronze_events<br/>Delta streaming table<br/>partitioned by ingest_dt"]
+    ET["events_typed (view)<br/>watermark 7d<br/>dropDuplicatesWithinWatermark"]
+    SP["silver_payments<br/>silver_invoices<br/>expectations enforced"]
+    QT["silver_quarantine<br/>inverted expectation"]
+    FG["fct_payment_state<br/>MATERIALIZED VIEW<br/>state machine"]
+    RD["reconciliation_daily"]
+
+    V --> AL --> BB --> ET
+    ET --> SP --> FG --> RD
+    ET --> QT
 ```
 
 **The partition key changes meaning between layers, and that is deliberate.**
@@ -169,30 +195,65 @@ Extending it toward the 5-7 day norm would recover much of the difference.
 ## 6. Repo layout
 
 ```
-src/
-  producer.py        synthetic events + injected defects + answer key
-  bronze_writer.py   consumer logic; --sink local|s3
-  lambda_handler.py  the deployed Kinesis -> S3 consumer
-  silver_job.py      parse · validate · quarantine · dedup · repartition
-  gold_job.py        match · state machine · reconciliation_daily
-  athena.py          catalog registration + bytes-scanned benchmark
-dags/
-  payment_lakehouse_dag.py   sensor → silver → gold → gate → metrics
-infra/
-  deploy.sh          Kinesis + IAM + Lambda + event source mapping
-  teardown.sh        deletes everything billable
-sql/
-  ddl.sql            explicit external table definitions
-notes/
-  failures.md        every incident, its diagnosis and fix
-  costs.md           measured storage, scan and run costs
-conf/
-  config.json        region, bucket, retry windows, defect rates
+src/                       AWS — producer, Lambda handler, pandas jobs, Athena
+glue/                      AWS — PySpark jobs for Glue
+dags/                      AWS — Airflow DAG with a reconciliation gate
+infra/                     AWS — deploy, teardown, alarms, Glue deployment
+sql/                       AWS — explicit external table definitions
+
+databricks/
+  01_setup.ipynb           Unity Catalog: catalog, schema, volume
+  02_producer.ipynb        event generator + control-total answer key
+  03_bronze.ipynb          Auto Loader streaming into a Delta table
+  04_silver.ipynb          watermark, dedup, foreachBatch MERGE, quarantine
+  05_gold.ipynb            state machine, reconciliation_daily, control total
+  06_dlt_pipeline.py       the same pipeline declaratively, with expectations
+
+tests/                     transformation tests
+notes/                     failures.md (incident log), costs.md (measurements)
+conf/                      region retry windows, defect rates
 ```
 
 ---
 
-## 7. How to run
+## 7. The Databricks implementation
+
+Built on Databricks Free Edition. Same business logic, same data, same answer
+key — verified against the AWS output row for row.
+
+| | |
+|---|---|
+| **Ingestion** | Auto Loader (`cloudFiles`) with `schemaEvolutionMode=rescue`, `availableNow` trigger — batch economics with streaming semantics |
+| **Late data** | `withWatermark("event_ts", "7 days")` + `dropDuplicatesWithinWatermark` — bounded dedup state matching the longest regional retry window |
+| **Upserts** | `foreachBatch` + Delta `MERGE`; the native streaming sink only appends |
+| **Governance** | Unity Catalog three-level namespace, managed tables, a Volume for the landing zone |
+| **Declarative** | A Lakeflow pipeline building the same seven datasets with expectations |
+| **Quality** | `expect` to flag, `expect_or_drop` to reject, and a second dataset with the inverted condition so nothing is lost silently |
+| **Late-data modelling** | Gold is a **materialized view**, not a streaming table — a late invoice must revise an already-computed aggregate, which append-only cannot do |
+
+### Three bugs worth reading `notes/failures.md` for
+
+```
+Auto Loader inferred `amount` as STRING, because the generator injects
+malformed values. A `<= 0` comparison then cast to BIGINT and killed the
+stream. try_cast turns it into a quarantined row instead of an outage.
+
+datediff() counts calendar boundaries, not elapsed time. Ten payments on
+the boundary were written off as expired. Every job reported SUCCESS.
+
+NOT (region IN (...)) where region IS NULL evaluates to NULL, not TRUE.
+Nine malformed records passed through neither the clean table nor the
+quarantine table — lost by the very thing built to catch them.
+```
+
+All three were caught the same way: the generator writes an answer key and every
+layer reconciles against it.
+
+---
+
+## 8. How to run
+
+### AWS
 
 ```bash
 python3 -m venv venv && source venv/bin/activate
@@ -205,21 +266,28 @@ python3 src/silver_job.py
 python3 src/gold_job.py
 
 # on AWS
-./infra/deploy.sh                                          # Kinesis + Lambda
+./infra/deploy.sh
 python3 src/producer.py --count 5000 --seed 42 --sink kinesis
 python3 src/silver_job.py --source s3 --sink s3
 python3 src/gold_job.py   --source s3 --sink s3
-python3 src/athena.py ddl
-python3 src/athena.py bench
-
-./infra/teardown.sh                                        # ALWAYS
+python3 src/athena.py ddl && python3 src/athena.py bench
+./infra/teardown.sh
 ```
+
+### Databricks
+
+Import `databricks/` into a workspace and run the notebooks in order. They
+create their own catalog, schema and volume, so no prior setup is needed.
+
+For the declarative version, create a Lakeflow pipeline pointing at
+`databricks/06_dlt_pipeline.py`, with a target catalog and schema of your
+choosing, and run it.
 
 `--seed` makes every run byte-identical, so a bug is the same bug twice.
 
 ---
 
-## 8. Teardown
+## 9. Teardown
 
 ```bash
 ./infra/teardown.sh          # stream, lambda, mapping, IAM role
