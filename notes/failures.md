@@ -396,6 +396,42 @@ semantics for "this row did not pass validation".
 2. The inverted-condition quarantine pattern only works if the inversion is
    null-safe. Otherwise the records most likely to be malformed — the ones with
    missing fields — are exactly the ones it fails to capture.
-3. Again, no error. The count was the only signal.
+---
+
+## 11. A background OPTIMIZE made a RESTORE fail
+
+**Severity:** transient — resolved by retrying
+
+Demonstrating time travel, a `RESTORE TABLE ... TO VERSION AS OF 1` failed:
+
+```
+DELTA_CONCURRENT_WRITE: a concurrent transaction has written new data
+since the current transaction read the table.
+Conflicting commit: {"operation":"OPTIMIZE", ... "auto":true}
+```
+
+**Cause:** auto-compaction ran in the background and committed a new version
+while the RESTORE was in flight. The RESTORE had read version 2 and attempted
+to commit version 3; OPTIMIZE got there first.
+
+**Why this is correct behaviour.** Delta does not lock the table. Writers
+proceed optimistically against a snapshot and attempt to commit a new version;
+conflicts are detected at commit time and the losing writer is rejected rather
+than silently overwriting. A table-level lock would make this impossible — and
+would serialise every writer, which is the opposite of what a lakehouse needs.
+
+**Resolution:** rerun the statement. It re-reads the current snapshot and
+re-applies against it.
+
+**Takeaways**
+
+1. Optimistic concurrency means retry logic is part of normal operation, not
+   error handling. Any client issuing writes to a shared Delta table needs it.
+2. Auto-compaction and auto-optimize are writers too. They commit versions and
+   can conflict with user operations, which is worth knowing before enabling
+   them on a table with concurrent access.
+3. Conflicts are evaluated per-file, so appends to disjoint partitions
+   generally do not collide. Operations that rewrite broad table state —
+   RESTORE, OPTIMIZE, large MERGEs — are the ones that race.
 
 ---
